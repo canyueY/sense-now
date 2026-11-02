@@ -165,7 +165,7 @@ test('R5: proxy 发出 Range、支持 206、累计字节、超限中止、abort 
     await assert.rejects(() => new Promise((resolve, reject) => {
       const req = http.get({ host: '127.0.0.1', port, path: `/${proxy.nonce}` }, resolve);
       req.on('error', reject);
-    }), /ECONNREFUSED|ECONNRESET|closed/i);
+    }), /ECONNREFUSED|ECONNRESET|closed|socket hang up/i);
   } finally {
     try { proxy.close(); } catch { /* ignore */ }
   }
