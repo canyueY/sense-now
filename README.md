@@ -17,428 +17,581 @@
 
 ---
 
-## 授权说明 / License
+# Sense Now（见闻）
 
-**Apache License 2.0** —— 随便用。个人、公司内部、闭源产品、SaaS、二次分发都可以，
-**不需要问我要授权，也不收费**。只要保留 [LICENSE](./LICENSE) 和 [NOTICE](./NOTICE) 这两份文件。
+[![CI](https://github.com/canyueY/sense-now/actions/workflows/ci.yml/badge.svg)](https://github.com/canyueY/sense-now/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
+[![Node.js](https://img.shields.io/badge/Node.js-%3E%3D20-339933.svg)](https://nodejs.org/)
 
-以下赞赏码来自原项目作者；如你希望支持上游维护，可以自愿使用，**不影响授权**：
+**让 Agent 不只能看见视频开头，而是能遍历整部视频、按问题回到证据，并在用户授权后补看画面、补听音频。**
 
-<p align="center">
-  <img src="./docs/images/reward-qr.png" alt="赞赏码（微信 / 支付宝）" width="240">
-</p>
+Sense Now 是一个面向 [DSH](https://github.com/deepseek-ai) 的本地多模态插件，包含两条彼此独立的工作流：
 
-提交 PR 前读一下 [CONTRIBUTING.md](./CONTRIBUTING.md) —— 现在**不需要签 CLA** 了，
-按 Apache-2.0 的规矩来就行。
+| 工具 | 职责 | 典型场景 |
+|---|---|---|
+| `sense_now` | 实时陪看屏幕 / 摄像头 / 本地文件；筛帧拼图；`say` 进悬浮窗 | 一边操作一边讲解、看直播/教程 |
+| `video_index` | 本地或 B 站视频一次建索引、多次问答；文本优先，音画按需 | 长访谈、讲座、录播回看 |
 
----
+> 当前版本：`0.1.0`（包名 `sense-now`）。这是开发版：单元测试与合成 benchmark **不能**解读为所有媒体、OCR、声卡和 B 站 CDN 都已实机验证。旧包名 `dsh-see-now` / 工具名 `see_now` 仅作兼容回退，新安装请用本仓库。
 
-## 看看它长什么样
+## 目录
 
-调试窗（开发期用，不在发布包里）：左边是**抓到的每一帧**，留下的带缩略图和格号，没留下的只剩一根分数条；右边是**正在拼的那张图**，按真实像素位置摆，新帧落格会亮一下，重排时格子会滑动。
+- [为什么重新设计](#为什么重新设计)
+- [核心能力](#核心能力)
+- [安装](#安装)
+- [快速开始：长视频索引](#快速开始长视频索引)
+- [实时陪看 `sense_now`](#实时陪看-sense_now)
+- [`analysisPolicy`](#analysispolicy)
+- [可选本地组件](#可选本地组件)
+- [`video_index` actions](#video_index-actions)
+- [Agent 协议要点](#agent-协议要点)
+- [抓播与取消语义](#抓播与取消语义)
+- [环境变量](#环境变量)
+- [存储、原子性与安全边界](#存储原子性与安全边界)
+- [测试与验证状态](#测试与验证状态)
+- [仓库结构](#仓库结构)
+- [作为 Node.js 库使用](#作为-nodejs-库使用)
+- [开发](#开发)
+- [已知限制](#已知限制)
+- [开源来源与许可](#开源来源与许可)
 
-![调试窗](docs/images/debug-window.png)
+## 为什么重新设计
 
-逐场景模式（`scene:true`）：每换一次画面单独出一张满幅图，右下角「已出图」每条都标着 `1 帧 100%`。
+原始的长视频方案主要依赖有上限的全片抓帧。当视频变长时，固定帧数会让采样越来越稀，甚至只保留开头部分；同时，把整部视频的所有字幕或图像一次性塞进上下文，也会快速消耗 token。
 
-![逐场景模式](docs/images/scene-mode.png)
+Sense Now 改用“**全片建索引，问题驱动补证据**”：
 
-悬浮窗：AI 说的话在这里出现并被念出来（`say` 是唯一通道）。
+```text
+视频来源
+  ↓
+字幕协调器（B 站字幕 / 外挂字幕 / 内嵌文本轨 / 流式 OCR / ASR fallback）
+  ↓
+5 分钟 core chunk + 20 秒输入重叠
+  ↓
+chunk catalog + 带时间戳的 evidenceId + coverage
+  ↓
+查询路由（文本 / 时间 / 视觉 / 音画 / 深度）
+  ↓
+只加载命中 chunk；必要时 zoom 或生成一次性 refinement 计划
+```
 
-![悬浮窗](docs/images/floating-window.png)
+这里的 5 分钟不是“只看 5 分钟”，而是将整部视频拆成可原子提交、可重试、可局部检索的小段。例如 2 小时视频约 24 个 core chunk；6 小时约 72 个。
 
----
+**时长路由（`execution:"auto"`）**：时长超过约 **12 分钟**（`SYNC_SAFE_MS`）时走后台 job，立即返回 `jobId`；更短则默认同步 `index`。也可显式 `sync` / `background`。
 
-## 它解决什么问题
+## 核心能力
 
-想让 AI 陪你看屏幕，最直觉的做法是"定时截全屏喂过去"。两个死结：
+### 1. 字幕优先，不做无意义重复识别
 
-| 做法 | 问题 |
-|---|---|
-| 每 2 秒截一张全屏 | 一分钟 30 张图，全是重复画面，token 直接烧穿 |
-| 每隔 30 秒截一张 | 中间发生了什么全丢了，AI 只会说"看起来你在用电脑" |
+显式传入 `analysisPolicy`（包括 `{}`）后，索引器进入字幕优先路径。实际优先级是：
 
-Sense Now 换了个思路：**先判断这一帧值不值得看，再决定传不传**。
+1. B 站解析结果中的官方字幕。
+2. 调用方已提供的字幕数据。
+3. 外部 `SRT` / `VTT` / `ASS` / `SSA` 文件。
+4. 媒体内嵌文本字幕轨；位图字幕轨会标记降级，而不会冒充文本。
+5. 无可靠字幕轨时，按 chunk 低帧率解码画面底部 ROI，字幕发生变化的候选帧才调用 OCR。
+6. 字幕/OCR 仍存在缺口且用户开启 `fallback` 或 `full` 时，才调用 ASR。
 
-- 每个画面帧先打一个 **0–255 的"变化分"**（HSV 三通道加权差，在 64×36 网格上算，约 0.2ms）
-- 只有"**画面突然换了一张**"或"**一直在动、攒够了量**"才留下来
-- 留下来的几帧**拼进同一张图**，一张图的固定成本摊到 4~8 帧上
+分层约束：
 
-结果：同样一段 30 秒的操作，别人烧 30 张图，这里常常只要 2~3 张。
+- **视频级**：只探测 / 下载官方、内嵌、外挂字幕（`probeOnly`）；后台长视频路径**不**在视频级跑全片 OCR。
+- **chunk 级**：OCR 严格落在 `[startMs, endMs)`；无可靠字幕时每个 chunk 原则上只启动一次 OCR FFmpeg。
+- 字幕轨缓存与 chunk OCR 缓存分离；不得把首块 OCR 结果当成整部视频的字幕轨。
 
----
+OCR 读取是**真流式**的：FFmpeg rawvideo 按帧消费，不全量缓冲 stdout（默认 ROI 下 5 分钟 × 1 FPS 约 93MB 吞吐，旧的 64MB 整段缓冲会误杀）。预算触顶或 abort 时会杀掉进程树并返回 `truncated` / `AbortError`。
 
-## 有多省
+### 2. 全片覆盖，查询时只读命中部分
 
-| 场景 | 表现 |
-|---|---|
-| 静止屏幕（看文档、发呆） | **几乎不出图**。20 秒给一张兜底帧，让你知道"确实没变" |
-| 滚网页、切窗口 | 变化剧烈 → 留几帧 → 每 15 秒左右给你一张 |
-| 一镜到底的视频 | 没有切点，靠"积分"攒够一个采样点才出帧 |
-| 硬切幻灯片（每张停 2 秒） | **每切一次留一帧**，6 张照片 → 6 帧 |
+- chunk core 默认 5 分钟，输入窗口在两侧各带最多 20 秒 overlap。
+- overlap 中的发言以时间中点决定所属 core chunk，再按文本、说话人与时间重叠去重。
+- `chunks/catalog.json` 只保留受限摘要、时间范围、说话人簇、coverage 和 revision，查询时不需把整库读进内存。
+- “整个视频讲了什么”之类泛问会按时间覆盖选取代表块，不是只返回开头的 Top 2–3 个命中。
+- 文本问题默认不附图；视觉问题优先复用 Storyboard，不足时再在命中时间附近 `zoom`。
 
-成本口径：**800×450 一张 ≈ 233 token**（按宿主 DeepSeek-V4 的 patch 网格算：14px patch 向上对齐 → 42px 一格 → `rows×(cols+1)+2`）。
-一张图里塞 4 帧还是 8 帧，**价格一样** —— 所以"多留一帧"几乎免费，"漏掉一帧"才贵。
+### 3. 字幕、音频、画面三者互补
 
-> 插件源码里 `SIZES` 的旧注释写着 218 token，那是早期按"像素 ÷ 1650"估的，偏低。以 233 为准。
+- **字幕**：承担全片结构、主题、关键段与文本检索。
+- **画面**：用于按钮、界面、图表、人物、手部操作、场景和视觉剪辑。
+- **语音活动辅助（VAD）**：只判断某个时间窗口是否有人说话，不会转写内容。
+- **ASR**：将音频转成文本，是与 VAD 分开的独立授权项。
+- **Diarization**：产生匿名说话人簇和活动时间段；不等于知道现实中是谁。
+- **Identity binding**：只有脸部/画面/音画时间证据足够时才能从 `tentative` 升级。纯音频不得标记 `ready`，也不会把单一音色自动写成“UP 主本人”。
 
----
+### 4. 证据可追溯，补充分析不静默覆盖
 
-## 快速开始
+字幕、ASR、画面、音频和事件都生成独立 `evidenceId`、逻辑 `evidence://` 引用、时间范围、`contentHash`、`revision` 与 `provenance`。
 
-### 在 DSH 里用
+局部 ASR、补抓画面或二次分析会追加新 revision，原始字幕证据保留。`full` evidence package 必须提供精确时间范围或 `evidenceIds`，禁止无范围展开整部视频。
+
+### 5. 二次复核与按需 ASR 有明确边界
+
+二次分析（`secondPass` / `postAnalysisAudit`）：
+
+- `off`：不产生自动复核。
+- `ask`：只返回计划，只有回传精确 `planHash` 才会执行。
+- `auto_once`：最多一次、受预算限制的局部重试，只能调整白名单参数。
+
+按需 ASR（`asr.mode=on_demand`）：
+
+- `query` 发现需要局部转写时，返回 `refinement`（含 `planHash`），并把计划**落盘**。
+- Agent 必须调用公开 action `execute_refinement`，不得臆造引擎内部函数名。
+- 同一 `planHash` 幂等；`asr.mode=off` 时所有公开入口零 ASR 调用。
+- VAD 授权 ≠ ASR 授权；`HF_TOKEN` / 本地模型存在不改变 effective policy。
+
+## 安装
+
+### 前置条件
+
+- Node.js 20 或更高版本。
+- DSH desktop profile。
+- FFmpeg / ffprobe：本地媒体时长探测、内嵌字幕、抽音频和按需帧依赖它们。
+- yt-dlp（可选）：索引 B 站链接时使用；可用 `DSH_YTDLP_PATH` 指定路径。
+- Python 组件（全部可选）：faster-whisper、pyannote.audio、loopback backend。
+
+### 安装到 DSH
 
 ```bash
 git clone https://github.com/canyueY/sense-now.git
 cd sense-now
-node scripts/install-dev.mjs      # 拷进本机 DSH 的 desktop profile
+node scripts/install-dev.mjs
 ```
 
-> `install-dev` 是**复制**不是软链（Node 解析裸包名要走真实路径，软链会找不到宿主的 `@deepseek-ai/dsh-tools`）。装完**重启 DSH** 生效。
+`install-dev` 会把包复制到 DSH desktop profile，注册 `sense-now`，并移除旧的 `dsh-see-now` 注册，避免两个插件重复注册工具。完成后重启 DSH。
 
-然后让模型调：
-
-```js
-sense_now({ action: "watch" })          // 阻塞到你攒够一张图，然后把图交回来
-sense_now({ action: "watch", say: "…" }) // 同时说一句话（只有 say 会进悬浮窗、会被念出来）
+```bash
+node scripts/install-dev.mjs --check   # 只检查
+node scripts/install-dev.mjs --remove  # 卸载 Sense Now
 ```
 
-第一次调用约 1 秒返回当前屏幕；之后每次返回"这段时间里发生的事"。
+Windows PowerShell 下同样可用上述命令；若默认 `python` 无依赖，请为 Whisper / pyannote / loopback 分别设置对应的 `DSH_*_PYTHON`。
 
-### 工作流 B：视频索引问答（`video_index`）
+## 快速开始：长视频索引
 
-与实时陪看**分开**：先建本地索引，再按问题检索证据（索引层**不编造**最终答案）。
-
-```js
-video_index({ action: "index", source: "file", path: "D:/talk.mp4" })
-video_index({
-  action: "index", source: "file", path: "D:/interview.mp4",
-  capabilities: { diarization: "on", identityBinding: "on" },
-  identityObservations: [/* face / speaker adapter observations */]
-})
-video_index({ action: "query", videoKey: "file:…:talk.mp4", question: "这段讲了什么" })
-video_index({ action: "query", videoKey: "file:…:interview.mp4", question: "谁在说话", mode: "multimodal" })
-video_index({ action: "query", videoKey: "…", question: "画面里按钮是什么颜色", mode: "visual" })
-video_index({ action: "list" })
-video_index({ action: "remove", videoKey: "…" })  // 只删这一个 key
-```
-
-| action | 作用 |
-|---|---|
-| `index` | 建/复用索引（同 fingerprint 默认复用；请求尚未就绪的 capability 或传入新 identity observations 时会重建；`rebuild:true` 强制重建）。可选 `capabilities`、`identityObservations`、`subtitlePath`（.srt/.vtt）；Bilibili 要 Storyboard 时需显式 `cacheMedia:true` |
-| `query` | 返回检索上下文与引用；文本问题默认不附图 |
-| `evidence` | 按 id / 时间范围取证据；`package:"minimal"\|"full"` |
-| `zoom` | 已有 Storyboard 不足时局部取帧（受 `maxZoomRequests` 限制） |
-| `status` / `list` / `remove` | 查看或精确删除一个 `videoKey` |
-| `cleanup` | 清临时文件与过期查询缓存；可选 `maxAgeMs`（需 `confirmDelete` + 精确 `confirmVideoKeys`）删过期索引；可选 `purgeTrash`（需 `confirmDelete`，可配 `trashMaxAgeMs`）清理 `.__trash-*` 恢复副本（仅当 live manifest 有效） |
-| `job_status` / `job_cancel` / `job_resume` | 长视频后台 job；`execution:"auto\|background"` 的 `index` 会立即返回 `jobId` |
-| `capture_start` / `capture_stop` | 显式抓播 MVP（手动 `region`；可选 localhost `cdpEndpoint`）。无 URL 时 `audioScope:"system_mix"` |
-| `refine` | 用 B 站 URL 对 capture/缺口做新 revision；或用 `confirmation.planHash` 确认二次分析计划（ask 模式无精确 hash 不写盘） |
-| `execute_refinement` | 确认并执行 `query` 返回的 `on_demand` ASR 计划：必须回传精确 `planHash` + `confirmation:true`；计划已落盘；同 hash 幂等不重复 ASR；`asr.mode=off` 时零调用 |
-
-`query` 在需要局部 ASR 时返回 `refinement: { kind:"on_demand_asr", status:"pending_confirmation", planHash, windows, … }`，Agent 应调用：
-
-```js
-video_index({
-  action: "execute_refinement",
-  videoKey,
-  planHash: refinement.planHash,
-  confirmation: true,
-})
-```
-
-不要调用引擎内部函数；VAD 授权不代表 ASR 授权。
-
-#### 字幕优先长视频（`analysisPolicy`）
-
-未传 `analysisPolicy` 时行为与旧版一致（含短片 `maxFrames:120` storyboard）。显式传入后走**全片字幕优先**：先建字幕索引与 catalog，完整画面按需补充；系统建议不会自动改参数。
-
-| 开关 | 默认 | 说明 |
-|---|---|---|
-| `subtitleFirst.enabled` | `true`（仅当传入 policy） | 低帧率字幕 ROI / 跳过批量全片抓帧 |
-| `speechActivityAssist.enabled` | `false` | 与 ASR **独立**；关闭时不跑 VAD |
-| `asr.mode` | `off` | `off` / `on_demand` / `fallback` / `full`；**不会**因 `HF_TOKEN` 自动打开 |
-| `analysisProfile.primary` | `general` | 用户选择；`profileSuggestion` 只返回建议 |
-| `secondPass` / `postAnalysisAudit.retryMode` | `off` / `ask` | `ask` 只出计划；`auto_once` 最多一次局部重试（白名单参数） |
-| `captureUtteranceEndFrame.enabled` | `false` | 段尾稳定帧；profile 建议不得自动打开 |
-
-示例（省资源 → 推荐 → 自动一次 → 深度）：
-
-```js
-// 最省：只要字幕轨，不要语音/二次分析
-video_index({ action: "index", path: "D:/long.mp4",
-  analysisPolicy: { asr: { mode: "off" }, speechActivityAssist: { enabled: false }, secondPass: { mode: "off" } } })
-
-// 推荐：字幕优先 + 类型建议（不自动应用）
-video_index({ action: "index", path: "D:/long.mp4", analysisPolicy: {} })
-
-// 预授权一次局部复核
-video_index({ action: "index", path: "D:/long.mp4",
-  analysisPolicy: { postAnalysisAudit: { enabled: true, retryMode: "auto_once" }, secondPass: { mode: "auto_once" } } })
-
-// 深度：用户显式 full ASR + 段尾帧（需自备 ASR adapter）
-video_index({ action: "index", path: "D:/long.mp4",
-  analysisPolicy: { asr: { mode: "full" }, captureUtteranceEndFrame: { enabled: true } } })
-```
-
-真实 OCR / ASR / VAD / AI auditor 需自行配置 adapter；未配置时 capability 为 `unavailable`/`skipped`，测试用协议级 fake，**不伪造 ready**。泛问（如「整个视频讲了什么」）会按时间覆盖选代表块，而不是只加载 Top 2～3。
-
-#### 短视频 vs 超长视频 / B 站流式
-
-- **短素材**：默认同步 `index`（与以前兼容）。
-- **超长（约 >12 分钟）**：`execution:"auto"` 会先探测时长（B 站走 `resolveStreams`，本地文件走 `ffprobe`），超过阈值自动转后台；也可显式传 `durationMs` / `execution:"background"`，工具立即返回 `jobId`。用 `job_status` 看进度；工具超时取消**不会**误杀已提交的后台 job，除非 `job_cancel`。
-- **URL 模式**（B 站普通投稿）：字幕/音频流是权威内容源；优先低清流与 Range 片段，**不默认下载整片 720p**。不支持直播、付费番剧、DRM、b23 短链。签名 URL / cookie **不落盘、不进模型上下文**。
-- **Capture 模式**：必须显式 `capture_start`（手动 `region`）；会启动 CDP tick、可选 loopback、区域抓帧。无 URL 时 `audioScope:"system_mix"`。崩溃后**不能**无缝续抓，会记 `gap`；有 URL 时用 `refine` 补洞。loopback 可选依赖：`pip install soundcard` 后 `python scripts/loopback-recorder.py --check`；未安装时插件仍可加载，但 `audioCapture` 为 unavailable。装了 soundcard 后把 `DSH_LOOPBACK_PYTHON` 指向该环境的 Python（否则默认 `python` 可能没有依赖）。
-- **CDP**：仅 `http://127.0.0.1:<port>`；内置 WebSocket transport（Node 22+ 全局 WebSocket）。Chrome 136+ 请用**独立** `--user-data-dir`，并加 `--remote-debugging-port` + `--remote-allow-origins=*`；只读采样 `video.currentTime/duration/paused/playbackRate`，不注入页面脚本。
-- **Speaker merge**：默认关闭。需同时 `diarization:"on"` 与 `speakerMerge:{enabled:true}`；合并需要额外的 **`pyannote/embedding`（gated: auto）** 或本地目录 `DSH_PYANNOTE_EMBEDDING_MODEL`。该模型不可用时**不会拖垮 diarization**：说话人仍产出，`capabilities.speakerMerge` 记 `unavailable`，跨块 ID 保持 provisional。embeddings 默认不落盘（`persistEmbeddings:false`），永不进入 query/context。
-- **检索**：长视频先扫 `chunks/catalog.json`；精确问加载命中+邻块，泛问走时间覆盖代表块（受硬预算）；citation 含 `chunkId` / `revision` / `timeSource`。
-- **Embeddings**：默认不持久化；仅 `persistSpeakerEmbeddings:true` 才写本地 `private/`，且永不进入 query/context。
-- **磁盘**：`cleanup` 清 job temp / 过期索引；活跃锁与唯一恢复副本默认保留。
-- **实测 vs 估算**：`npm run bench:long-video` 只报告本机数字；抓播误差、实时倍率等**未在本仓库 CI 实测**，不要当 SLA。
-
-索引目录默认：`${DSH_HOME}/sense-now/video-index/`（可用 `DSH_SENSE_VIDEO_INDEX` 覆盖；旧的 `DSH_SEE_VIDEO_INDEX` 仍兼容）。  
-**依赖：** Storyboard 需要本机 FFmpeg；Bilibili 需要可选 `yt-dlp`（`DSH_YTDLP_PATH`）；ASR/OCR/人物为可选外部命令适配器，未配置时记 `unavailable`，**不会假转写**。抓播 loopback 为可选 Python 依赖（`scripts/loopback-recorder.py --check`），未安装时插件仍可加载。  
-人物贴图与音色绑定是实验能力：状态机有单测，真实识别需自行接入 adapter。脸/声纹默认不进模型上下文，也不默认持久化生物特征。
-
-#### 启用本地 ASR（faster-whisper，可选）
-
-索引器内置可选的 `faster-whisper` runner（`scripts/asr-runner.py`），**默认关闭**；只有 `DSH_WHISPER_ENABLED=1` 或设置 `DSH_WHISPER_MODEL` 才启用。没有 ASR 时索引仍可建，只是 `utterances/chapters` 为空、状态 `degraded`。
-
-```powershell
-python -m pip install faster-whisper
-$env:DSH_WHISPER_ENABLED = "1"
-$env:DSH_WHISPER_PYTHON = "D:\...\.venv-pyannote\Scripts\python.exe"
-$env:DSH_WHISPER_MODEL = "Systran/faster-whisper-small"   # 或本地模型目录
-$env:DSH_WHISPER_DEVICE = "cpu"
-$env:DSH_WHISPER_COMPUTE_TYPE = "int8"                     # CPU 推荐
-```
-
-探测与兼容：`python scripts/asr-runner.py --check` 只验证 import，不下载模型；首次转写会把模型下到 HF 缓存（可用 `HF_HOME` 改到可写目录）。转写时间戳是 chunk-local，JS 适配器会加 `offsetMs` 并写 `chunkId`。
-
-#### 启用真实说话人分离（pyannote.audio）
-
-索引器内置了可选的本地 `pyannote.audio` runner。**默认关闭**；只有显式设置 `DSH_PYANNOTE_ENABLED=1` 才会启用。  
-`HF_TOKEN` / `HUGGINGFACE_HUB_TOKEN` / `DSH_PYANNOTE_MODEL` **只是模型访问凭据，不会单独打开功能**。  
-设置 `DSH_PYANNOTE_ENABLED=0` 可强制关闭（即使已有 token 或本地模型）。
-
-启用后，`diarization:"on"` 会执行真实音色分离，把 speaker、时间段写入 `audio-index.json`，回填 utterance，并在 `query.context.speakers` / minimal|full package 中返回**受限**说话人视图。首次真实推理可能下载模型；CPU 上可能较慢。`available()` 的 `--check` 只验证 Python/pyannote 能否导入，**不需要 token 或本地模型，也不会下载权重**。
-
-runner 直接读取索引侧抽出的 **16 kHz 单声道 PCM WAV**，不经过 torchcodec，因此在**静态 ffmpeg**（没有 `avcodec-*.dll`）的 Windows 上也能工作；stdio 固定为 UTF-8，中文路径可用。
-
-1. 使用 Python 3.10+ 安装依赖：`python -m pip install "pyannote.audio>=4,<5"`。
-2. 在 Hugging Face 接受 `pyannote/speaker-diarization-community-1` 的使用条款并创建访问令牌（勿把真实 token 写进仓库或日志）。
-3. 设置环境变量：
-
-```powershell
-$env:DSH_PYANNOTE_ENABLED = "1"           # 必须显式 opt-in
-$env:HF_TOKEN = "hf_..."                  # 凭据，不是开关
-$env:DSH_PYANNOTE_PYTHON = "python"       # 可选：虚拟环境 Python
-$env:DSH_PYANNOTE_DEVICE = "auto"         # auto / cpu / cuda
-```
-
-离线：把 `DSH_PYANNOTE_MODEL` 指向本地模型目录；仍需 `DSH_PYANNOTE_ENABLED=1`。runner 默认 `PYANNOTE_METRICS_ENABLED=0`。
-
-**Speaker merge（可选）**：跨块合并需要额外的 `pyannote/embedding`（gated: `auto`），或在本地下载后设置 `DSH_PYANNOTE_EMBEDDING_MODEL`。该模型不可用时 **diarization 仍正常**，`speakerMerge` 记 `unavailable`，跨块 speaker 保持 provisional，不会把整段索引拖垮。
-
-```powershell
-# 可选：本地 embedding 模型（需先接受 pyannote/embedding 条款）
-python -c "from huggingface_hub import snapshot_download; snapshot_download('pyannote/embedding', local_dir=r'D:/models/pyannote-embedding')"
-$env:DSH_PYANNOTE_EMBEDDING_MODEL = "D:/models/pyannote-embedding"
-```
-
-```powershell
-# 先把约 33 MB 模型下到本地（之后可完全离线）
-python -c "from huggingface_hub import snapshot_download; snapshot_download('pyannote/speaker-diarization-community-1', local_dir=r'D:/models/pyannote-community-1')"
-$env:DSH_PYANNOTE_MODEL = "D:/models/pyannote-community-1"
-```
+### 本地视频
 
 ```js
 video_index({
   action: "index",
   source: "file",
-  path: "D:/interview.mp4",
-  capabilities: { diarization: "on", asr: "on", identityBinding: "on" },
-  rebuild: true
+  path: "D:/videos/long-talk.mkv",
+  execution: "auto",
+  analysisPolicy: {}
 })
+```
 
+`analysisPolicy: {}` 表示显式启用字幕优先默认值：ASR 关闭、VAD 关闭、段尾帧关闭，profile 只建议不自动应用。如果完全不传 `analysisPolicy`，则保留兼容的旧版 Storyboard 行为。
+
+长视频可能立即返回 `jobId`：
+
+```js
+video_index({ action: "job_status", jobId: "..." })
+video_index({ action: "job_cancel", jobId: "..." })
+video_index({ action: "job_resume", jobId: "..." })  // 跳过已 ready 的 chunk
+```
+
+可选：外挂字幕 `subtitlePath: "D:/subs/talk.srt"`；强制重建 `rebuild: true`。
+
+### B 站视频
+
+```js
+video_index({
+  action: "index",
+  source: "bilibili",
+  url: "https://www.bilibili.com/video/BV...",
+  execution: "background",
+  analysisPolicy: { asr: { mode: "off" } }
+})
+```
+
+B 站模式只接受受控 HTTPS 域名，拒绝 `b23.tv`、裸 IP、localhost 和内网地址。签名 URL、Cookie 和 token 不进入模型上下文，也不写入索引。需要 Storyboard 或本地 ASR 时，必须显式 `cacheMedia: true` 并评估下载成本。多分 P 可用 `partId`（默认 `p1`）。
+
+### 查询全片
+
+```js
 video_index({
   action: "query",
-  videoKey: "...",
-  question: "分别有哪些人在说话，他们各自说了什么？",
-  mode: "multimodal"
+  videoKey: "file:...:long-talk.mkv",
+  question: "整个视频的主要论点和结论是什么？",
+  mode: "auto"
 })
 ```
 
-手工 smoke（不进 `npm test`）：见 `scripts/smoke-pyannote.md`。
+查询路由是确定性的，不需要额外模型：
 
-画面人物与 speaker 的确认绑定仍需人脸证据或 `identityObservations`；**纯音频不得标 `identityBinding:ready`，也不会把单一音色标成「UP 主本人」**。
-
-### 不进 DSH，当普通 Node 库用
-
-包本身不依赖 DSH，`capture` / `pipeline` / `png` / `video-index` 都是独立导出的：
-
-```js
-import { spawnFrames } from 'sense-now/capture';
-import { createPipeline } from 'sense-now/pipeline';
-
-const p = createPipeline({ width: 800, height: 450, fps: 12, queueDepth: 0 });
-const run = spawnFrames({
-  source: { kind: 'screen' },           // 或 { kind:'file', path:'x.mp4' }
-  width: 800, height: 450, fps: 12,
-  onFrame: (f) => p.push(f),
-});
-
-setInterval(() => {
-  const sheet = p.take();               // 一张 PNG + 每帧的时间戳/档位/来源
-  if (sheet) require('fs').writeFileSync(`sheet-${sheet.at}.png`, sheet.png);
-}, 200);
-```
-
----
-
-## 参数
-
-| 参数 | 说明 |
+| mode | 用途 |
 |---|---|
-| `action` | `watch`（默认，阻塞取图）/ `peek` / `start` / `stop` / `status` |
-| `say` | **唯一能进悬浮窗、能被念出来的通道**。普通回复用户看不到 |
-| `quality` | `low`(800×450) / `standard` / `high` / `ultra`。改它会重启采集（~0.6s），并立刻返回当前这一帧 |
-| `pace` | 节奏：`calm` / `normal`（默认）/ `dense`。见下 |
-| `scene` | `true` = 逐场景模式：一张图只装一个画面、铺满。见下 |
-| `seconds` | `watch` 的阻塞上限（默认 300，封顶 860）。只是上限，攒够一张就提前返回 |
-| `minFrames` | 少于这么多帧的图就别给我了（省 token） |
-| `source` / `path` / `realtime` | 采集源：屏幕 / 摄像头 / 回放一个视频文件 |
+| `text` | 主题、章节、说了什么 |
+| `time` | 时间戳、第几分钟、开头或结尾 |
+| `visual` | 画面、界面、颜色、按钮、图表、人脸或穿着 |
+| `multimodal` | 谁在说话、音画是否一致、口型/声音/画面关系 |
+| `deep` | 详细分析、比较、复核或证据审计 |
+| `auto` | 根据问题词路由到上述类型 |
 
-### 三档节奏（`pace`）
+`query` 返回的是可供 Agent 回答的证据与引用，不把索引层的规则聚合冒充成最终答案。
 
-| 档 | 换画面门槛 | 最多多久叫醒一次 | 适合 |
-|---|---|---|---|
-| `calm` | 20 分 | 30 秒 | 日常挂着，只想知道"大场面变了没" |
-| **`normal`**（默认） | 12 分 | 15 秒 | 滚网页、切窗口不会每下都留帧 |
-| `dense` | 7 分 | 8 秒 | 幻灯片、逐帧播报 —— 贵，别常开 |
-
-> 觉得它太吵、太烧钱，就说一句「慢一点 / 省点钱」，模型会传 `pace:"calm"`。
-> 觉得它漏了、迟钝，就说「不灵敏」，它会传 `dense`。
-
-### 逐场景模式（`scene`）
-
-打开后**每换一次画面单独给你一张满幅图**，并且每换一次就叫你一次 —— 用来做"每翻一页说一句这是什么"。
+### 按需补画面
 
 ```js
-sense_now({ scene: true, say: "好，接下来每换一个画面我就说一句" })
+video_index({
+  action: "zoom",
+  videoKey: "...",
+  startMs: 1019000,
+  endMs: 1022000,
+  roi: { x: 0, y: 0, width: 1280, height: 720 }
+})
 ```
 
-它是粘性的，一直生效到 `scene:false` 或停止。
-单帧铺满靠的是 `strategy: 'single'`（档位固定压到 1），不然场景一密，格子会缩到 1/4、1/9，中间全是灰条。
+`timestampMs` 保持视频绝对时间，不会在非零 seek 后重复叠加 chunk 偏移。`onDemandVisual` 为 `ready` 表示媒体可访问且 FFmpeg/提取器已探针通过；无媒体、无提取器或 policy 禁用时分别为 `unavailable` / `disabled`，不会因“有默认函数名”就标 ready。
 
----
+### 确认局部 ASR refinement
 
-## 它是怎么判断"变了"的
+当 `query` 返回 `refinement.status="pending_confirmation"` 时：
 
-两条判据，缺一不可：
-
-**① 切点** —— 这一帧的分数跳得又高又孤立
-
-```
-score ≥ cutAbs(12)                 // 绝对地板：变化够不够大
-score > 2.5 × max(1, 前后帧)        // 尖峰：是不是"一下子"
-距上一刀 ≥ 0.4 秒                   // 不应期
+```js
+video_index({
+  action: "execute_refinement",
+  videoKey: "...",
+  planHash: refinement.planHash,
+  confirmation: true
+})
 ```
 
-**② 积分** —— 分不高但一直有，攒够才录一帧
+必须使用查询返回的精确 `planHash`。同一 hash 幂等，不会重复运行 ASR。支持 **monolithic index** 与 **chunk catalog** 两种布局；跨 chunk 窗口按 utterance 中点唯一归属。
 
+### 取证与清理
+
+```js
+// 最小引用包
+video_index({ action: "evidence", videoKey: "...", evidenceIds: ["ev_..."] })
+
+// Full package：必须带精确范围或 ids
+video_index({
+  action: "evidence",
+  videoKey: "...",
+  package: "full",
+  startMs: 600000,
+  endMs: 660000
+})
+
+// 清理临时文件与查询缓存；删索引需双重确认
+video_index({ action: "cleanup", dryRun: true })
+video_index({
+  action: "cleanup",
+  maxAgeMs: 30 * 24 * 3600 * 1000,
+  confirmDelete: true,
+  confirmVideoKeys: ["file:...:old.mkv"]
+})
 ```
-need = 4分 × 12fps × 3秒 = 144      // 固定的绝对阈值，不跟着画面一起涨
-每帧累加自己的分，累够就录、清零
+
+## 实时陪看 `sense_now`
+
+```js
+sense_now({ action: "watch" })
+sense_now({ action: "watch", say: "我看到你已经进入设置页" })
+sense_now({ action: "peek" })
+sense_now({ action: "status" })
+sense_now({ action: "stop" })
 ```
 
-为什么两个都要：**尖峰是相对的**，在低分区也会成立。实测缓慢放大（持续运动）有帧 `s=13.6`、前后邻居只有 1.1/1.3，尖峰判据完全放行 —— 没有绝对地板，它就会被切成一块块。
-反过来只有地板也不行：一镜到底的视频每帧 4 分，永远不会"跳"。
+| 要点 | 说明 |
+|---|---|
+| `watch` | **阻塞调用**是正常陪看方式；攒够一张 sheet 或用户插话后返回。回复后应再次 `watch`，不要结束回合。 |
+| `peek` | 插件主动唤醒（“有新画面了”）后取已攒好的图，不再次等待。 |
+| `say` | **唯一**进入悬浮窗并被语音播报的通道；普通回复文字用户看不到也听不到。 |
+| `pace` | `calm` / `normal` / `dense`：控制留帧与叫醒密度；用户说太密/太贵时立刻 `calm`。 |
+| `scene` | `true` 时每场景一张满幅图并更频繁叫醒；默认关，未明确要求勿开。 |
+| `quality` | `low` → `ultra`；看不清文字立即升档，勿猜。改档会短重启采集并先回一张当前屏。 |
+| `source` | `screen`（默认）/ `obs` / `camera` / `file`+`path`（回放调试）。 |
 
----
+实时管线会先在 64×36 采样网格上计算 HSV 加权差分，再用两类信号留帧：
 
-## 调试窗（不在插件里）
+- 孤立高尖峰：适合换页、硬切和窗口切换。
+- 运动积分：适合滚动、缓慢变焦和一镜到底。
 
-```bash
-npm run debug:live                                   # 看屏幕
-npm run debug:live -- --source=file --file=x.mp4 --realtime=1
-npm run debug:live -- --source=file --file=x.mp4 --scene    # 看逐场景模式
+留下的帧会拼成 sheet，而不是每帧单独交给模型。用户关闭悬浮窗后插件会停止并留下挂断说明；收到挂断后**不要**再调 `sense_now`，直到用户重新要求。
+
+调参矩阵与实测说明见 [`docs/调参与实测.md`](./docs/调参与实测.md)。
+
+## `analysisPolicy`
+
+建议从最小授权开始：
+
+```js
+video_index({
+  action: "index",
+  source: "file",
+  path: "D:/videos/demo.mp4",
+  analysisPolicy: {
+    subtitleFirst: { enabled: true, scanFps: 1, roi: "auto" },
+    speechActivityAssist: { enabled: false, useVad: true },
+    asr: { mode: "off" },
+    analysisProfile: { primary: "general", secondary: [] },
+    profileSuggestion: { enabled: true },
+    secondPass: { mode: "off", maxPasses: 1 },
+    postAnalysisAudit: { enabled: false, retryMode: "ask", maxRetries: 1 },
+    captureUtteranceEndFrame: { enabled: false, maxPerChunk: 12 }
+  }
+})
 ```
 
-Windows 上可以直接双击 `debug/调试窗.cmd`，跟着菜单走。
+### ASR 模式
 
-窗口里有三样东西：**帧流**（每一帧都有一条，留下的带缩略图和格号）、**正在拼的 sheet**（按真实像素位置摆，新帧落格有动效）、**两条曲线**（每帧变化分 + 积分累积/阈值）。
+- `off`：所有入口都不得调用 ASR。
+- `on_demand`：只允许用户问题或已确认 refinement 触发局部 ASR。
+- `fallback`：字幕/OCR 缺口时允许 ASR。
+- `full`：索引阶段执行全量 ASR。
 
-代码在 `debug/`，**不进 npm 包、不进插件**，只是从外面驱动同一条流水线。
+旧 `capabilities.asr`（`off` / `auto` / `on`）在同时传入 `analysisPolicy` 时仍映射为 `off` / `fallback` / `full`。`HF_TOKEN`、已下载模型或本地 Python 环境都不会改变 effective policy。
 
----
+### 内容 profile
 
-## 实测（本机 i9-12900HX / RTX 4060 Laptop / 2560×1600）
+profile 是用户选择的分析倾向，不是隐式自动开关。当前包含：
 
-采集开销（12fps → 800×450）：
+`general`、`visual_edit`、`handcraft`、`anime`、`film`、`screen_tutorial`、`slides_lecture`、`interview`、`talking_head`、`gameplay`、`sports`、`news_documentary`、`product_review`、`vlog`、`music_stage`、`surveillance_timelapse`。
 
-| 源 | 首帧 | CPU |
+`profileSuggestion` 只返回画面密度、ROI、场景灵敏度、段尾帧和音频能力的建议；用户显式参数永远优先，建议不会直接开启 ASR。
+
+### 预算硬顶（节选）
+
+| 项 | 默认倾向 | 硬顶量级 |
 |---|---|---|
-| `ddagrab`（桌面复制 API） | 370ms | **0.28 核** |
-| `gdigrab`（GDI 抓屏） | 310ms | 0.45 核 |
-| OBS 虚拟摄像头 | 575ms | 0.13 核 |
+| `scanFps` | 1 | ≤ 4 |
+| `maxFramesScannedPerChunk` | 300 | ≤ 400 |
+| `maxOcrCallsPerMinute` | 20 | ≤ 30 |
+| `maxOcrCallsPerChunk` | 90 | ≤ 120 |
+| `maxOcrRuntimeMsPerChunk` | 90s | ≤ 120s |
+| `maxRefineWindows` | 2 | ≤ 3 |
+| `maxAudioSecondsPerWindow` | 30 | ≤ 120 |
 
-变化分刻度（0–255，同一套代码）：
+`Infinity` / `NaN` / 夸张大数无法绕过硬顶。触顶时显式返回 `truncated` 与 `limitReasons`。
 
-| 内容 | 分数 |
+## 可选本地组件
+
+### faster-whisper ASR
+
+默认关闭。只有 `DSH_WHISPER_ENABLED=1` 或显式设置 `DSH_WHISPER_MODEL` 才启用 runner；这个运行时开关仍不能绕过 `analysisPolicy.asr.mode`。
+
+```powershell
+python -m pip install faster-whisper
+$env:DSH_WHISPER_ENABLED = "1"
+$env:DSH_WHISPER_PYTHON = "D:/venvs/sense-now/Scripts/python.exe"
+$env:DSH_WHISPER_MODEL = "Systran/faster-whisper-small"
+$env:DSH_WHISPER_DEVICE = "cpu"
+$env:DSH_WHISPER_COMPUTE_TYPE = "int8"
+python scripts/asr-runner.py --check
+```
+
+`--check` 只检查 import，不下载模型。
+
+### pyannote.audio 说话人分离
+
+默认关闭，必须显式设置 `DSH_PYANNOTE_ENABLED=1`。`HF_TOKEN`、`HUGGINGFACE_HUB_TOKEN` 和本地模型路径只是凭据/资源，不是功能开关。
+
+```powershell
+python -m pip install "pyannote.audio>=4,<5"
+$env:DSH_PYANNOTE_ENABLED = "1"
+$env:DSH_PYANNOTE_PYTHON = "D:/venvs/sense-now/Scripts/python.exe"
+$env:HF_TOKEN = "hf_..."  # 只放环境变量，不得写入仓库
+$env:DSH_PYANNOTE_DEVICE = "auto"
+python scripts/audio-visual-runner.py --check
+```
+
+跨 chunk speaker merge 还需要 embedding 模型，并显式开启 `speakerMerge.enabled`。embedding 默认只存在内存，不进入 query/context；不可用时 diarization 仍可以返回 provisional speaker。
+
+### VAD、OCR 与 loopback
+
+- VAD 默认不带生产 runner，需要注入 `speechActivity` adapter，且 `speechActivityAssist.enabled=true`。
+- OCR 默认不带具体模型，需要注入 OCR adapter。未配置时状态为 `unavailable`，不伪造识别结果。
+- Windows 系统混音抓播需 `soundcard` 或 `pyaudiowpatch`：`python scripts/loopback-recorder.py --check`。
+
+## `video_index` actions
+
+| action | 作用 |
 |---|---|
-| 静止桌面 | **0.00**（屏幕采集近似无损） |
-| 光标在静止画面上移动 | **0.7** |
-| 两张色调接近的照片切换 | 16~18 |
-| 滚网页 / 切窗口 | 30~42 |
-| 两张完全不同的照片切换 | 46~63 |
+| `index` | 索引本地文件或 B 站链接；`execution`: `auto` / `sync` / `background` |
+| `query` | 返回受预算限制的检索上下文和引用；可能附带 `refinement` |
+| `evidence` | 按 id 或时间范围取证；`package`: `minimal` / `full` |
+| `zoom` | 在已索引的时间窗口补一张完整画面或 ROI |
+| `status` / `list` | 查看索引 |
+| `remove` | 只删除精确 `videoKey` 的索引，不删原媒体 |
+| `cleanup` | 清临时文件与过期查询缓存；删过期索引 / trash 需确认 |
+| `job_status` / `job_cancel` / `job_resume` | 管理后台 chunk job |
+| `capture_start` / `capture_stop` | 显式开始/停止抓播；无 URL 时属 system-mix 录音授权 |
+| `refine` | B 站 URL 补洞或确认二次分析计划（`confirmation.planHash`） |
+| `execute_refinement` | 确认并执行 query 产生的 on-demand ASR 计划 |
 
-所以 `cutAbs: 12` 这个默认值的位置是：**照片切换抓得住，光标和微小抖动碰不到**。
+## Agent 协议要点
 
----
+1. **两个工具不要混用职责**：实时陪看用 `sense_now`；离线长视频用 `video_index`。索引过程本身不叫醒模型。
+2. **先 index / 等 job，再 query**：后台 job 未到 `ready`/`degraded` 终态前，勿假设末尾 chunk 已可检索。
+3. **看到 `refinement.planHash` → 调 `execute_refinement`**：不要调用文档或返回值里不存在的内部 API（例如臆造的 `executeOnDemandAsr()`）。
+4. **`say` 才是用户通道**：陪看时把要对用户说的话放进同一次 `watch` 的 `say`。
+5. **证据不足就说不足**：capability 为 `unavailable` / `degraded`，或 `truncated` / `omittedEvidenceIds` 出现时，不要编造画面或台词。
+6. **返回值必须是无损 JSON**：工具层会去掉 `undefined`；Agent 侧也不要依赖不可序列化字段。
 
-## 目录
+## 抓播与取消语义
 
+`capture_start` 会创建 controller，在开始 recorder 之前注册 segment 回调，定时采样 CDP，抓取手工选定的屏幕区域，并将音频 segment/画面帧组成 capture bundle。暂停、倍速、seek 和 gap 使用 piecewise wall-time → video-time 映射。
+
+`job_cancel` 先持久化 `cancelRequested`，再中止 controller。在 chunk 分析前后、commit 前、catalog 前和终态前都有 attempt/cancel 守卫；已取消 job 不得被迟到回调覆盖成 `ready`。`job_resume` 跳过已 ready 的 chunk。
+
+CDP 只接受 `http://127.0.0.1:<port>` 或 localhost 等价地址。Chrome 136+ 建议使用独立 `--user-data-dir`。
+
+## 环境变量
+
+| 变量 | 作用 |
+|---|---|
+| `DSH_HOME` | DSH 主目录（默认 `~/.dsh`） |
+| `DSH_SENSE_VIDEO_INDEX` | 索引根目录（旧名 `DSH_SEE_VIDEO_INDEX` 兼容） |
+| `DSH_FFMPEG_PATH` | ffmpeg 可执行文件 |
+| `DSH_YTDLP_PATH` | yt-dlp 可执行文件 |
+| `DSH_SENSE_WINDOW` / `DSH_SEE_WINDOW` | 悬浮窗 `window.py` 路径 |
+| `DSH_SENSE_NO_WINDOW` / `DSH_SEE_NO_WINDOW` | `=1` 时禁用悬浮窗 |
+| `DSH_SENSE_PYTHON` / `DSH_SEE_PYTHON` | 跑悬浮窗的 Python |
+| `DSH_WHISPER_*` | faster-whisper 开关与模型（见上节） |
+| `DSH_PYANNOTE_*` / `HF_TOKEN` | pyannote 开关与凭据（token **不得**入库） |
+| `DSH_LOOPBACK_PYTHON` | loopback 录音用的 Python |
+| `DSH_VOICE_ADAPTER` | 语音播报适配器 |
+| `DSH_TOOLS_PATH` | 本地开发时解析 `@deepseek-ai/dsh-tools` |
+
+## 存储、原子性与安全边界
+
+默认索引根目录：`${DSH_HOME}/sense-now/video-index/`。可用 `DSH_SENSE_VIDEO_INDEX` 覆盖；旧的 `DSH_SEE_VIDEO_INDEX` 仅作兼容回退。Windows 下目录名将 `:` 编码为 `=`。
+
+```text
+video-index/
+  <encoded-video-key>/
+    manifest.json
+    detail/subtitle-segments.json
+    detail/utterances.json
+    analysis/coverage.json
+    analysis/recommendations.json
+    analysis/effective-policy.json
+    analysis/audit.json
+    evidence/evidence-index.json
+    evidence/storyboard-index.json
+    evidence/audio-index.json
+    refinements/                   # plan-*.json / exec-*.json
+    chunks/
+      catalog.json
+      000000/
+        chunk-manifest.json
+        utterances.json
+        events.json
+        speakers.json
+        storyboard.json
+        evidence.json
+        chapters.json
 ```
+
+写入先进入 staging，完整文件写完后才原子切换 live generation，manifest 最后写入。发布过程有 journal/trash 恢复语义，默认不删唯一恢复副本。
+
+其他安全约束：
+
+- `videoKey`、`jobId`、`chunkId` 和 evidence 相对路径在拼接前校验，拒绝路径穿越。
+- 远程媒体与字幕下载：HTTPS、域名白名单、相对重定向再校验、DNS 拒私网/loopback、Content-Type 校验、累计字节硬顶；URL query/签名不进日志、evidence、catalog 或模型可见 metadata。
+- stdout/stderr 有上限；OCR 流式路径只限制残片缓冲，不再用整段 stdout 顶死正常 5 分钟扫描。超时或取消时终止进程树。
+- embeddings 默认不持久化，不进入 query/context。
+- Capability 状态：`disabled` / `skipped` / `unavailable` / `pending` / `degraded` / `ready`；未验证的 adapter **不写假 ready**。
+
+本项目**不**上传屏幕、不连续录像、不捆绑采集驱动或 TTS 引擎；详见 [`NOTICE`](./NOTICE)。
+
+## 测试与验证状态
+
+当前仓库验收基线：
+
+- 60 个 `*.test.mjs` 文件，`npm test`：**285 pass / 0 fail**。
+- GitHub Actions 在 Windows 和 Ubuntu 分别执行 Python `py_compile`、285 项 Node 测试与 `npm pack --dry-run --json`。
+- npm pack：**120 个包内条目**，不包含 `.env`、`__pycache__`、`.pyc`、模型缓存和测试媒体。
+- 合成 / 注入级覆盖：流式 OCR 预算停 FFmpeg、probeOnly 分层、真后台 `indexAdaptive` 等 job 后检索片尾、`execute_refinement` 幂等、字幕下载 SSRF/Content-Type、`onDemandVisual` 探针等。
+- 6 小时 / 72 chunk benchmark 是合成数据下的检索基准，不是真实 OCR/ASR 吞吐 SLA。
+
+**未用 stub 冒充、需自行实机确认的部分：**
+
+- 不同 B 站账号、字幕权限、CDN、地区和签名 URL 的端到端稳定性。
+- 真实 OCR / VAD / ASR 在多种分辨率、噪声和语言条件下的准确率。
+- 真实多人场景的跨 chunk speaker 一致率与人脸—音色绑定质量。
+- 不同 Windows 声卡和 loopback backend 的兼容性。
+
+手工 smoke 文档：[`smoke-subtitle-first.md`](./scripts/smoke-subtitle-first.md)、[`smoke-pyannote.md`](./scripts/smoke-pyannote.md)、[`smoke-capture.md`](./scripts/smoke-capture.md)。变更记录见 [`CHANGELOG.md`](./CHANGELOG.md)。
+
+## 仓库结构
+
+```text
 src/
-  capture.js         唯一 spawn ffmpeg 的地方（实时采集仍 -an）
-  cuts.js / pipeline.js / tiers.js / pack.js / sheet.js
-  runner.js / loop.js / index.js   实时陪看
-  video-index-tool.js              video_index 工具
-  video-index/                     离线索引子系统（schema/store/engine/adapters…）
-examples/floating-chat/   悬浮窗（Tk，无边框圆角，置顶）
-debug/                    调试窗（不在 npm 包里）
-test/                     回归 + 索引子系统测试
-docs/V1.1-COMPOSER-GROK-IMPLEMENTATION.md   V1.1 实施基线
+  index.js                         DSH 插件注册（sense_now + video_index）
+  tool-spec.js                     sense_now 工具协议
+  capture.js / pipeline.js         实时采集与筛帧
+  cuts.js / tiers.js / pack.js     切点、节奏、拼图
+  runner.js / loop.js              陪看会话与自动唤醒
+  window.js / voice.js / chat.js   悬浮窗、语音、会话记录
+  video-index-tool.js              video_index 工具路由
+  video-index/
+    video-index-engine.js          索引/查询/补充分析主引擎
+    analysis-policy.js             策略规范化与硬顶
+    subtitle-coordinator.js        视频级 + chunk 级字幕协调
+    subtitle-stream-source.js      真流式 ROI rawvideo
+    subtitle-band-scanner.js       字幕变化门控与 OCR 预算
+    subtitle-download.js           受控字幕 URL 下载
+    native-subtitle.js             内嵌字幕探测/提取
+    refinement-plan.js             on_demand planHash 落盘与校验
+    on-demand-asr.js               局部 ASR（含 chunk catalog）
+    chunk-plan.js / chunk-store.js 5 分钟分块与原子存储
+    job-controller.js              后台 job / cancel / resume
+    index-retriever.js             两级检索与 speaker-aware 上下文
+    evidence-*.js                  证据、package、audit 和 revision
+    capture-controller.js          抓播控制器
+    metered-media-proxy.js         受控 Range proxy
+    adapters/                      字幕、ASR、OCR、VAD、pyannote、B 站等
+scripts/                           Python runners、bench、install-dev、smoke
+examples/floating-chat/            悬浮窗 bundle
+test/                              60 个测试文件 / 285 项测试
+docs/                              方案、调参与复验文档
 ```
 
-基准（合成帧，可重复）：
+## 作为 Node.js 库使用
+
+DSH 是可选 peer dependency（`@deepseek-ai/dsh-tools`）。核心采集、拼图与索引引擎可独立导入：
+
+```js
+import { createPipeline } from "sense-now/pipeline";
+import { spawnFrames } from "sense-now/capture";
+import { createVideoIndexEngine } from "sense-now/video-index";
+```
+
+对索引引擎进行集成时，应显式传入 `rootDir`，并通过 `adapters` 注入 OCR、VAD、实体、人脸或其他生产组件。稳定导出面见 `package.json` 的 `exports`。
+
+## 开发
 
 ```bash
-npm run bench:video-index   # 旧单体 A/B synthetic benchmark（--duration-hours 会被忽略）
-npm run bench:long-video    # 6h chunk catalog/retrieval benchmark（流式索引）
+npm test
+npm run bench:video-index -- --synthetic
+npm run bench:long-video
+npm pack --dry-run --json --ignore-scripts
+python -m py_compile scripts/audio-visual-runner.py scripts/asr-runner.py scripts/loopback-recorder.py
 ```
 
+其他常用脚本：
 
----
+```bash
+npm run install-dev
+npm run check:window      # 校验悬浮窗 bundle
+npm run debug:live        # 实时差分调试窗
+```
+
+`main` 分支已开启保护，要求 Windows 和 Ubuntu 两个 CI 状态检查通过，禁止 force push 与分支删除。
 
 ## 已知限制
 
-- **只认"画面变了"，不认"语义变了"**。同一句话的两个排版版本算变化，两段内容不同但长得很像的页面可能算没变。
-- **没有跨帧去重**（除了 `dupMin` 那道粗筛）。它不保证给你的每一帧都"有新信息"。
-- **唤醒有节流**：再密也不会超过 `pace` 里的间隔 —— 语音播报是串行的，更快只会排队。
-- **Windows 优先**。`ddagrab` / `gdigrab` 是 Windows 的引擎，Linux/macOS 需要自己补采集源。
+- 当前是 Windows-first；屏幕采集主要使用 `ddagrab` / `gdigrab`。
+- OCR 与 VAD 只定义了生产适配协议，仓库不默认携带模型。
+- B 站不支持付费番剧、DRM、直播与 `b23.tv` 短链。
+- 抓播崩溃后不能无缝恢复；系统会保留 gap，并允许使用 URL `refine` 补洞。
+- active-speaker / face-tracker 及人物—音色绑定仍是实验能力，真实识别质量取决于接入的人脸、口型、speaker 和时间同步证据。
+- 任何 capability 为 `unavailable` / `degraded` 或证据被预算截断时，Agent 都应明确说明证据不足，而不是猜测。
 
----
+## 开源来源与许可
 
-## 协议
+Sense Now 基于 SAOS-3624 的 [dsh-see-now](https://github.com/SAOS-3624/dsh-see-now) 继续开发。本仓库保留上游的 Apache-2.0 [`LICENSE`](./LICENSE)、[`NOTICE`](./NOTICE) 和作者归属，并在此基础上新增字幕优先长视频索引、分块检索、按需音画证据、权限开关、预算硬顶、原子发布和安全边界。
 
-**Apache License 2.0** —— 商用、闭源、再分发、改完再卖都可以，保留 [LICENSE](./LICENSE) 与
-[NOTICE](./NOTICE) 即可。
-
-`examples/floating-chat/` 来自同作者的另一个项目 `dsh-watch-together`，两边现在是**同一个协议**，
-不再有"这个目录 Apache、其余非商业"的分裂。
-
-愿意打赏就扫上面那个码 —— 不打赏一样能用全部功能，**没有任何东西锁在付费后面**。
-
-Copyright © 2026 SAOS-3624
+使用、修改和再分发时，请遵守 Apache License 2.0 并保留 `LICENSE` 与 `NOTICE`。
