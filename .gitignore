@@ -1,0 +1,31 @@
+# 依赖
+node_modules/
+.venv-pyannote/
+.venv*/
+__pycache__/
+*.pyc
+*.pyo
+pip-*/
+torchinductor_*/
+dsh-see-now/
+.pytest_cache/
+*.tgz
+
+# 调试/标定产物（素材、截图、日志、临时脚本）
+.tmp/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+
+# 本地环境
+.env
+.env.local
+
+# 内部交接记录（引用本机路径与兄弟仓库），不公开
+overview.md

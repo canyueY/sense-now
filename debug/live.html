@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>sense-now · 取帧与拼图</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#151a22; --panel2:#1b212b; --line:#242c39;
+    --fg:#e7ebf2; --dim:#8b94a7; --dim2:#5d6678;
+    --keep:#ffcb2f; --cut:#ff5c7a; --mark:#3ec6ff; --floor:#a78bfa; --bad:#ff4d4f;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg); color:var(--fg); overflow:hidden;
+    font:13px/1.45 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+    display:flex; flex-direction:column;
+  }
+  /* ---------------- 顶栏 ---------------- */
+  header{
+    display:flex; align-items:center; gap:10px; padding:7px 12px;
+    background:var(--panel); border-bottom:1px solid var(--line); flex:0 0 auto;
+    white-space:nowrap; overflow:hidden;
+  }
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--bad);box-shadow:0 0 8px var(--bad);flex:0 0 auto}
+  .dot.live{animation:pulse 1.6s infinite}
+  @keyframes pulse{50%{opacity:.35}}
+  #srcinfo{
+    color:var(--dim); font-variant-numeric:tabular-nums; font-size:12px;
+    overflow:hidden; text-overflow:ellipsis; max-width:42%; flex:0 1 auto;
+  }
+  #srcinfo b{color:var(--fg);font-weight:600}
+  .counters{display:flex; gap:9px; margin-left:auto; font-variant-numeric:tabular-nums; font-size:12px; flex:0 0 auto}
+  .counters .k{color:var(--dim); font-size:11px; margin-right:2px}
+  .counters .v{font-weight:600}
+  .v.cut{color:var(--cut)} .v.mark{color:var(--mark)} .v.floor{color:var(--floor)}
+  button{
+    background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+    border-radius:6px; padding:4px 9px; cursor:pointer; font:inherit; font-size:12px;
+    flex:0 0 auto; white-space:nowrap;
+  }
+  button:hover{background:#232b38; border-color:#334054}
+  button:active{transform:translateY(1px)}
+  /* ---------------- 曲线 ---------------- */
+  #scope{display:flex; gap:10px; padding:8px 12px 4px; flex:0 0 auto}
+  .chart{flex:1; position:relative; min-width:0}
+  .chart canvas{display:block; width:100%; height:56px; border-radius:6px; background:var(--panel)}
+  .chart .cap{
+    position:absolute; left:8px; top:4px; font-size:10.5px; color:var(--dim);
+    pointer-events:none; letter-spacing:.02em;
+  }
+  .chart .cap b{color:var(--fg); font-weight:600}
+  /* ---------------- 主体 ---------------- */
+  main{flex:1; display:grid; grid-template-columns:minmax(300px,0.9fr) minmax(420px,1.25fr); gap:10px; padding:8px 12px 12px; min-height:0}
+  section{
+    background:var(--panel); border:1px solid var(--line); border-radius:9px;
+    display:flex; flex-direction:column; min-height:0; overflow:hidden;
+  }
+  h2{
+    margin:0; padding:7px 10px; font-size:11.5px; font-weight:600; letter-spacing:.04em;
+    color:var(--dim); border-bottom:1px solid var(--line); display:flex; align-items:center; gap:8px;
+    flex:0 0 auto; text-transform:uppercase;
+  }
+  h2 .meta{margin-left:auto; font-weight:400; text-transform:none; letter-spacing:0; font-variant-numeric:tabular-nums}
+  /* ---------------- 帧流 ---------------- */
+  #stream{overflow-y:auto; padding:6px; display:flex; flex-direction:column; gap:3px}
+  #stream::-webkit-scrollbar{width:8px}
+  #stream::-webkit-scrollbar-thumb{background:#2b3342; border-radius:4px}
+  .skip{
+    display:flex; align-items:center; gap:7px; height:13px; padding:0 4px;
+    color:var(--dim2); font-size:10.5px; font-variant-numeric:tabular-nums;
+  }
+  .skip .bar{flex:1; height:3px; background:#1d232d; border-radius:2px; overflow:hidden}
+  .skip .bar i{display:block; height:100%; background:#3b4557; border-radius:2px}
+  .skip .t{width:46px; text-align:right; opacity:.7}
+  .skip .sp{width:34px; text-align:right}
+  /* 分数接近切点门槛但没过的帧：单独高亮，方便一眼看到"差在哪里" */
+  .skip.near{color:#d9a441}
+  .skip.near .bar i{background:#c08a2e}
+  .skip.near .sp{font-weight:700}
+  .skip.drop{color:#4a5468}
+  .row{
+    display:flex; gap:8px; padding:4px; border-radius:7px; align-items:center;
+    background:var(--panel2); border:1px solid #202834;
+    animation:pop .22s ease-out;
+  }
+  @keyframes pop{from{opacity:0; transform:translateY(-5px)}}
+  .row img{width:86px; height:48px; object-fit:cover; border-radius:4px; background:#0b0e13; flex:0 0 auto}
+  .row .info{min-width:0; flex:1; display:flex; flex-direction:column; gap:2px}
+  .row .l1{display:flex; align-items:center; gap:6px; font-variant-numeric:tabular-nums}
+  .row .tt{font-weight:600; font-size:12px}
+  .row .sc{color:var(--dim); font-size:11px}
+  .row .l2{font-size:10.5px; color:var(--dim)}
+  .chip{
+    font-size:10px; padding:0 5px; border-radius:4px; line-height:15px; font-weight:600;
+    letter-spacing:.02em; flex:0 0 auto;
+  }
+  .chip.cut{background:rgba(255,92,122,.15); color:var(--cut)}
+  .chip.mark{background:rgba(62,198,255,.15); color:var(--mark)}
+  .chip.floor{background:rgba(167,139,250,.15); color:var(--floor)}
+  .chip.start{background:rgba(255,203,47,.15); color:var(--keep)}
+  .chip.user{background:rgba(255,255,255,.08); color:var(--dim)}
+  .chip.tier{background:#2a3242; color:#9fb0c9}
+  /* ---------------- 右侧 ---------------- */
+  #right{display:flex; flex-direction:column; min-height:0}
+  #sheetwrap{padding:10px; flex:1; min-height:0; display:flex; flex-direction:column; gap:8px}
+  #cells{
+    position:relative; width:100%; aspect-ratio:16/9; border-radius:7px;
+    background:
+      repeating-linear-gradient(0deg,transparent 0 38px,#1a2029 38px 39px),
+      repeating-linear-gradient(90deg,transparent 0 38px,#1a2029 38px 39px),
+      #0b0e13;
+    border:1px solid #1e2632; overflow:hidden; flex:0 0 auto;
+  }
+  .cell{
+    position:absolute; border-radius:3px; overflow:hidden; background:#0b0e13;
+    transition:left .26s cubic-bezier(.25,.9,.3,1), top .26s cubic-bezier(.25,.9,.3,1),
+               width .26s cubic-bezier(.25,.9,.3,1), height .26s cubic-bezier(.25,.9,.3,1),
+               opacity .18s;
+    box-shadow:inset 0 0 0 1px rgba(0,0,0,.55);
+  }
+  .cell img{width:100%; height:100%; object-fit:cover; display:block}
+  .cell .tag{
+    position:absolute; font-size:9.5px; line-height:1; padding:2px 3px; border-radius:3px;
+    background:rgba(0,0,0,.62); color:#ffe680; font-variant-numeric:tabular-nums;
+  }
+  .cell .tag.i{left:2px; top:2px; font-weight:700}
+  .cell .tag.k{right:2px; top:2px; color:#a9c0d8}
+  .cell .tag.v{left:2px; bottom:2px; color:#9fb0c9}
+  .cell.new{animation:ring .5s ease-out}
+  @keyframes ring{0%{box-shadow:inset 0 0 0 2px var(--keep), 0 0 12px rgba(255,203,47,.55)}100%{box-shadow:inset 0 0 0 1px rgba(0,0,0,.55)}}
+  #empty{
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    color:var(--dim2); font-size:12px; pointer-events:none;
+  }
+  #sheetmeta{
+    display:flex; gap:14px; font-size:11px; color:var(--dim); flex-wrap:wrap;
+    font-variant-numeric:tabular-nums; flex:0 0 auto;
+  }
+  #sheetmeta b{color:var(--fg); font-weight:600}
+  #sheetmeta .warn{color:var(--bad)}
+  #done{
+    display:flex; gap:6px; overflow-x:auto; padding:8px 10px 10px;
+    border-top:1px solid var(--line); flex:0 0 auto;
+  }
+  #done::-webkit-scrollbar{height:7px}
+  #done::-webkit-scrollbar-thumb{background:#2b3342; border-radius:4px}
+  .sheetcard{
+    flex:0 0 auto; width:122px; border-radius:6px; overflow:hidden; cursor:pointer;
+    border:1px solid #232b38; background:var(--panel2); animation:pop .25s ease-out;
+  }
+  .sheetcard:hover{border-color:#3a4a63}
+  .sheetcard img{width:100%; display:block; aspect-ratio:16/9; object-fit:cover}
+  .sheetcard .m{padding:3px 5px; font-size:10px; color:var(--dim); display:flex; justify-content:space-between; font-variant-numeric:tabular-nums}
+  .sheetcard.bad{border-color:var(--bad)}
+  /* ---------------- 大图 ---------------- */
+  #overlay{
+    position:fixed; inset:0; background:rgba(4,6,9,.9); display:none; align-items:center;
+    justify-content:center; z-index:9; cursor:zoom-out;
+  }
+  #overlay.on{display:flex}
+  #overlay img{max-width:96vw; max-height:92vh; border-radius:8px; box-shadow:0 16px 60px rgba(0,0,0,.7)}
+  #toast{
+    position:fixed; left:50%; bottom:16px; transform:translateX(-50%);
+    background:#222a36; border:1px solid #334054; color:var(--fg);
+    padding:6px 14px; border-radius:16px; font-size:12px; opacity:0;
+    transition:opacity .25s; pointer-events:none; z-index:10;
+  }
+  #toast.on{opacity:1}
+</style>
+</head>
+<body>
+<header>
+  <span class="dot live" id="dot"></span>
+  <span id="srcinfo">等待采集…</span>
+  <div class="counters">
+    <div><span class="k">帧</span><span class="v" id="c-frames">0</span></div>
+    <div><span class="k">留</span><span class="v" id="c-kept">0</span></div>
+    <div><span class="k">切</span><span class="v cut" id="c-cuts">0</span></div>
+    <div><span class="k">积</span><span class="v mark" id="c-marks">0</span></div>
+    <div><span class="k">兜</span><span class="v floor" id="c-floors">0</span></div>
+    <div><span class="k">重</span><span class="v" id="c-dup">0</span></div>
+    <div><span class="k">图</span><span class="v" id="c-sheets">0</span></div>
+  </div>
+  <button id="btn-interject" title="走真实的 flushNow 路径：立刻把这一批截断出图">插话</button>
+  <button id="btn-clear" title="只清界面，采集继续">清空</button>
+  <button id="btn-stop" title="停掉采集（服务端还在，可以刷新看）">停止</button>
+</header>
+
+<div id="scope">
+  <div class="chart">
+    <canvas id="cv-score"></canvas>
+    <div class="cap">每帧变化分 · 参考强度 <b id="refv">4</b> · 最大 <b id="maxv">-</b></div>
+  </div>
+  <div class="chart">
+    <canvas id="cv-acc"></canvas>
+    <div class="cap">积分累积 / 阈值 <b id="needv">-</b> <span id="accv"></span></div>
+  </div>
+</div>
+
+<main>
+  <section>
+    <h2>抓到的帧 <span class="meta" id="stream-meta"></span></h2>
+    <div id="stream"></div>
+  </section>
+
+  <section id="right">
+    <h2>正在拼的 sheet <span class="meta" id="batch-meta">空</span></h2>
+    <div id="sheetwrap">
+      <div id="cells"><div id="empty">还没有留下的帧</div></div>
+      <div id="sheetmeta"></div>
+    </div>
+    <h2>已出图 <span class="meta" id="done-meta"></span></h2>
+    <div id="done"></div>
+  </section>
+</main>
+
+<div id="overlay"><img id="ovimg" alt=""></div>
+<div id="toast"></div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const W = 800, H = 450;              // 由 hello 覆盖
+  let C = {};                          // 插件 constants
+  let need = 1, refScore = 4;
+
+  /* ---------- 曲线 ---------- */
+  const scores = [];                   // {t, s, kept, via}
+  const accs = [];                     // {t, a}
+  const MAXP = 420;
+
+  function fitCanvas(cv) {
+    const dpr = window.devicePixelRatio || 1;
+    const r = cv.getBoundingClientRect();
+    cv.width = Math.max(1, Math.round(r.width * dpr));
+    cv.height = Math.max(1, Math.round(r.height * dpr));
+    const g = cv.getContext('2d');
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return { g, w: r.width, h: r.height };
+  }
+
+  function drawScore() {
+    const cv = $('cv-score');
+    const { g, w, h } = fitCanvas(cv);
+    g.clearRect(0, 0, w, h);
+    if (!scores.length) return;
+    const top = Math.max(24, ...scores.map((d) => d.s || 0)) * 1.12;
+    const bw = w / MAXP;
+    scores.forEach((d, i) => {
+      const x = w - (scores.length - i) * bw;
+      const s = d.s || 0;
+      const bh = Math.max(0.5, (s / top) * (h - 6));
+      g.fillStyle = d.kept
+        ? (d.via === 'cut' ? 'rgba(255,92,122,.95)'
+          : d.via === 'floor' ? 'rgba(167,139,250,.95)' : 'rgba(255,203,47,.95)')
+        : 'rgba(120,136,160,.55)';
+      g.fillRect(x, h - bh, Math.max(0.8, bw * 0.82), bh);
+    });
+    // 参考强度线
+    const ry = h - (refScore / top) * (h - 6);
+    g.strokeStyle = 'rgba(62,198,255,.55)'; g.lineWidth = 1;
+    g.setLineDash([3, 3]);
+    g.beginPath(); g.moveTo(0, ry); g.lineTo(w, ry); g.stroke();
+    g.setLineDash([]);
+  }
+
+  function drawAcc() {
+    const cv = $('cv-acc');
+    const { g, w, h } = fitCanvas(cv);
+    g.clearRect(0, 0, w, h);
+    if (!accs.length) return;
+    const top = Math.max(need * 1.15, ...accs.map((d) => d.a || 0));
+    const bw = w / MAXP;
+    g.beginPath();
+    accs.forEach((d, i) => {
+      const x = w - (accs.length - i) * bw + bw / 2;
+      const y = h - ((d.a || 0) / top) * (h - 6);
+      if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+    });
+    g.strokeStyle = 'rgba(255,203,47,.9)'; g.lineWidth = 1.4; g.stroke();
+    g.lineTo(w, h); g.lineTo(Math.max(0, w - accs.length * bw), h); g.closePath();
+    g.fillStyle = 'rgba(255,203,47,.10)'; g.fill();
+    // 阈值线
+    const ny = h - (need / top) * (h - 6);
+    g.strokeStyle = 'rgba(62,198,255,.6)'; g.lineWidth = 1;
+    g.setLineDash([3, 3]);
+    g.beginPath(); g.moveTo(0, ny); g.lineTo(w, ny); g.stroke();
+    g.setLineDash([]);
+  }
+
+  let drawPending = false;
+  function scheduleDraw() {
+    if (drawPending) return;
+    drawPending = true;
+    requestAnimationFrame(() => { drawPending = false; drawScore(); drawAcc(); });
+  }
+  window.addEventListener('resize', scheduleDraw);
+
+  /* ---------- 帧流 ---------- */
+  const stream = $('stream');
+  const MAXROWS = 320;
+
+  function trimStream() {
+    while (stream.childElementCount > MAXROWS) stream.lastElementChild.remove();
+  }
+
+  function addSkip(d) {
+    const el = document.createElement('div');
+    // 够到门槛七成的帧单独标出来：这正是"差一点就被认成切点"的那些，
+    // 调 cutAbs 时看它们落在多少分，比看曲线估要准。
+    const near = (d.score ?? 0) >= (C.cutAbs ?? 7) * 0.7;
+    el.className = `skip${near ? ' near' : ''}`;
+    const pct = Math.min(100, ((d.score || 0) / Math.max(8, refScore * 3)) * 100);
+    el.innerHTML = `<span class="t">${fmtT(d.t)}</span>`
+      + `<span class="bar"><i style="width:${pct.toFixed(0)}%"></i></span>`
+      + `<span class="sp">${d.score === null ? '–' : d.score}</span>`;
+    stream.prepend(el);
+  }
+
+  function addKept(d) {
+    const el = document.createElement('div');
+    el.className = 'row';
+    el.dataset.t = d.t;                 // 让 batch 事件能回头把「格号」补上
+    const tier = d.tier ?? d.level;
+    el.innerHTML = `<img src="data:image/png;base64,${d.big || d.img}" alt="">`
+      + `<div class="info">`
+      + `<div class="l1"><span class="tt">${fmtT(d.t)}</span>`
+      + `<span class="chip ${d.via}">${viaName(d.via)}</span>`
+      + `<span class="chip tier">${tier} 档</span>`
+      + `<span class="chip idx"></span>`
+      + `<span class="sc">分 ${d.score ?? '–'}</span></div>`
+      + `<div class="l2">${tierHint(tier)}${d.dup !== null && d.dup !== undefined ? ` · 与上张差 ${d.dup}` : ''}</div>`
+      + `</div>`;
+    stream.prepend(el);
+  }
+
+  function fmtT(t) { return (t ?? 0).toFixed(1) + 's'; }
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  }
+  function viaName(v) {
+    return { cut: '切点', mark: '积分', floor: '兜底', start: '首帧', user: '插话', now: '此刻', oneshot: '单帧' }[v] || v;
+  }
+  function tierHint(k) {
+    const cells = Math.round(k * k);
+    return `占 1/${k * k} 画布 · 一张最多约 ${cells} 格`;
+  }
+
+  /* ---------- sheet 画布 ---------- */
+  const cellsBox = $('cells');
+  const cellMap = new Map();   // t -> node
+  const thumbs = new Map();    // t -> base64（frame 事件带过来，batch 事件只有数字）
+
+  function ensureCell(t) {
+    let node = cellMap.get(t);
+    if (node) return node;
+    node = document.createElement('div');
+    node.className = 'cell';
+    node.innerHTML = `<img alt=""><span class="tag i"></span><span class="tag k"></span><span class="tag v"></span>`;
+    node.style.opacity = '0';
+    cellsBox.appendChild(node);
+    cellMap.set(t, node);
+    // 入场：先透明，下一帧放开；同时给一圈高亮，看得出"这一帧刚落进来"
+    requestAnimationFrame(() => { node.style.opacity = '1'; node.classList.add('new'); });
+    setTimeout(() => node.classList.remove('new'), 620);
+    return node;
+  }
+
+  function applyBatch(d) {
+    const rowsArr = d.rows || [];
+    const lay = d.layout || { cells: [] };
+    const seen = new Set();
+
+    rowsArr.forEach((r, i) => {
+      const c = lay.cells[i];
+      if (!c) return;
+      seen.add(r.t);
+      const node = ensureCell(r.t);
+      // 用百分比定位，容器缩放时不用重算
+      node.style.left = (c.px / W * 100) + '%';
+      node.style.top = (c.py / H * 100) + '%';
+      node.style.width = (c.pw / W * 100) + '%';
+      node.style.height = (c.ph / H * 100) + '%';
+      const img = node.querySelector('img');
+      // 缩略图可能比 batch 晚到（握手时补发的那一份就没有图）——
+      // 只要手里有图就补上，别指望"设过一次就永远对"。
+      const tb = thumbs.get(r.t) || r.img;
+      if (tb && !img.dataset.filled) { img.src = `data:image/png;base64,${tb}`; img.dataset.filled = '1'; }
+      node.querySelector('.tag.i').textContent = i + 1;
+      node.querySelector('.tag.k').textContent = r.tier + '/8';
+      node.querySelector('.tag.v').textContent = viaName(r.via);
+      // 帧流里那张卡片也标上同一个格号 —— 一眼看出「这一帧落在第几格」
+      const card = stream.querySelector(`.row[data-t="${r.t}"] .chip.idx`);
+      if (card) { card.textContent = `#${i + 1}`; card.style.background = 'rgba(255,203,47,.18)'; card.style.color = 'var(--keep)'; }
+    });
+
+    // 出图后被移走的格子：淡出再删
+    for (const [t, node] of cellMap) {
+      if (seen.has(t)) continue;
+      cellMap.delete(t);
+      node.style.opacity = '0';
+      setTimeout(() => node.remove(), 200);
+    }
+
+    const n = rowsArr.length;
+    $('empty').style.display = n ? 'none' : '';
+    $('empty').textContent = n ? '' : '还没有留下的帧';
+    $('batch-meta').textContent = n ? `${n} 帧` : '空';
+    const tokens = Math.round((W * H) / 1667);
+    const fillPct = ((lay.fill || 0) * 100).toFixed(0);
+    const warn = d.overflow ? ' <span class="warn">装不下（下一帧就会出图）</span>' : '';
+    $('sheetmeta').innerHTML = n
+      ? `<span>排布 <b>${lay.bins} 箱</b></span>`
+        + `<span>占用 <b>${fillPct}%</b></span>`
+        + `<span>档位 <b>${(lay.seq || []).join(',')}</b></span>`
+        + `<span>预估 <b>${tokens}</b> token（固定，与帧数无关）</span>${warn}`
+      : '';
+  }
+
+  /* ---------- 已出图 ---------- */
+  let doneCount = 0;
+  function addSheet(d) {
+    doneCount += 1;
+    const card = document.createElement('div');
+    card.className = 'sheetcard' + (d.check === 'bad' ? ' bad' : '');
+    card.innerHTML = `<img src="${d.png}" alt="">`
+      + `<div class="m"><span>${d.from.toFixed(1)}–${d.to.toFixed(1)}s</span>`
+      + `<span>${d.frames.length}帧 ${Math.round(d.fill * 100)}%</span></div>`;
+    card.title = `${d.why} · ${d.kb}KB · ${d.check === 'bad' ? '复算不一致！' : '复算一致'}`;
+    card.onclick = () => { $('ovimg').src = d.png; $('overlay').classList.add('on'); };
+    $('done').prepend(card);
+    while ($('done').childElementCount > 10) $('done').lastElementChild.remove();
+    $('done-meta').textContent = `${doneCount} 张 · 最近 ${d.kb}KB`;
+    if (d.check === 'bad') toast('⚠ 复算的排布和真实 cells 不一致（见 console）');
+    if (d.check === 'bad') console.warn('layout mismatch', d.checkCounts);
+  }
+
+  /* ---------- 事件 ---------- */
+  const es = new EventSource('/events');
+
+  es.addEventListener('hello', (e) => {
+    const d = JSON.parse(e.data);
+    C = d.constants || {};
+    need = d.need; refScore = d.refScore ?? 4;
+    $('refv').textContent = refScore;
+    $('needv').textContent = need.toFixed(0);
+    document.title = `${d.source} · ${C.width}×${C.height}@${C.fps}fps · sense-now 调试`;
+    const label = d.source === 'screen' ? '屏幕' : (d.sourceDetail || d.source);
+    $('srcinfo').innerHTML = `<b>${esc(label)}</b> `
+      + `${C.width}×${C.height}@${C.fps} · 阈值 ${need.toFixed(0)}`;
+    // 细节塞进 tooltip：窗口只有 1220px，堆在标题栏里会换行
+    $('srcinfo').title = `积分阈值 ${need.toFixed(0)} = 参考强度 ${refScore} × ${C.fps}fps × ${C.integralSeconds}s\n`
+      + `假切点加成 mark+${C.markBoost} / floor+${C.floorBoost}（满 ${C.boostMinFrames} 帧生效）\n`
+      + `去重门槛 ${C.dupMin} · 最长等 ${C.maxWaitSec}s · 封箱代价 ${C.binCost}`;
+  });
+
+  es.addEventListener('frame', (e) => {
+    const d = JSON.parse(e.data);
+    if (d.kept) { addKept(d); thumbs.set(d.t, d.big || d.img); } else { addSkip(d); }
+    trimStream();
+    scores.push({ s: d.score ?? 0, kept: d.kept, via: d.via });
+    if (scores.length > MAXP) scores.shift();
+    accs.push({ a: d.acc ?? 0 });
+    if (accs.length > MAXP) accs.shift();
+    $('maxv').textContent = d.score === null ? '–' : Math.max(0, ...scores.map((x) => x.s)).toFixed(0);
+    $('accv').textContent = d.drift ? '（复算漂移，已停显）' : (d.acc !== null ? `当前 ${d.acc}` : '');
+    $('stream-meta').textContent = `留 ${scores.filter((x) => x.kept).length}/${scores.length}（最近 ${(scores.length / (C.fps || 12)).toFixed(0)} 秒）`;
+    scheduleDraw();
+  });
+
+  es.addEventListener('batch', (e) => applyBatch(JSON.parse(e.data)));
+
+  es.addEventListener('sheet', (e) => {
+    const d = JSON.parse(e.data);
+    addSheet(d);
+    // 这一批已经画进图里了，格子节点与缩略图都清掉（下一批重新建）
+    for (const [t, node] of cellMap) {
+      cellMap.delete(t); thumbs.delete(t);
+      node.style.opacity = '0'; setTimeout(() => node.remove(), 200);
+    }
+    $('empty').style.display = '';
+    $('empty').textContent = '刚出图，等下一帧';
+    $('batch-meta').textContent = '等下一帧';
+    $('sheetmeta').innerHTML = `<span>上一张：<b>${d.frames.length} 帧</b> · 占用 <b>${Math.round(d.fill * 100)}%</b>`
+      + ` · 原因 <b>${d.why}</b> · ${d.check === 'bad' ? '<span class="warn">复算不一致</span>' : '复算一致'}</span>`;
+  });
+
+  es.addEventListener('stats', (e) => {
+    const d = JSON.parse(e.data);
+    $('c-frames').textContent = d.frames;
+    $('c-kept').textContent = d.kept;
+    $('c-cuts').textContent = d.cuts;
+    $('c-marks').textContent = d.marks;
+    $('c-floors').textContent = d.floors;
+    $('c-dup').textContent = d.dupSkipped;
+    $('c-sheets').textContent = d.sheets;
+    if (d.check?.bad > 0) $('done-meta').textContent += ` · 不一致 ${d.check.bad}`;
+  });
+
+  es.addEventListener('note', (e) => toast(JSON.parse(e.data).text));
+  es.addEventListener('done', (e) => {
+    const d = JSON.parse(e.data);
+    $('dot').classList.remove('live');
+    toast(`采集结束（${d.reason}）· ${d.stats.frames} 帧 → ${d.stats.sheets} 张`);
+  });
+  es.onerror = () => { $('dot').classList.remove('live'); toast('连接断了 —— 服务端还在吗？'); };
+
+  /* ---------- 交互 ---------- */
+  $('btn-interject').onclick = async () => {
+    await fetch('/cmd?do=interject').catch(() => toast('服务端没响应'));
+    toast('已模拟一次插话');
+  };
+  $('btn-stop').onclick = async () => {
+    await fetch('/cmd?do=stop').catch(() => toast('服务端没响应'));
+    toast('已停止采集');
+  };
+  $('btn-clear').onclick = () => {
+    stream.innerHTML = ''; scores.length = 0; accs.length = 0;
+    $('done').innerHTML = ''; doneCount = 0; $('done-meta').textContent = '';
+    scheduleDraw(); toast('视图已清空（采集还在跑）');
+  };
+  $('overlay').onclick = () => $('overlay').classList.remove('on');
+  document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') $('overlay').classList.remove('on'); });
+
+  let toastTimer = null;
+  function toast(text) {
+    const el = $('toast');
+    el.textContent = text;
+    el.classList.add('on');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove('on'), 2200);
+  }
+})();
+</script>
+</body>
+</html>

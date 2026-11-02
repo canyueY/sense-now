@@ -1,0 +1,13 @@
+{
+  "name": "sense-now",
+  "description": "Sense Now（见闻）：实时陪看，并以字幕优先方式为长视频建立可检索的本地多模态索引。",
+  "version": "0.1.0",
+  "entry": {
+    "name": "sense-now",
+    "inject": [
+      "sessionController",
+      "tools",
+      "attachments"
+    ]
+  }
+}

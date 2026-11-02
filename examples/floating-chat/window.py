@@ -1,0 +1,1828 @@
+#!/usr/bin/env python3
+# ⚠️ 本文件由 sense-now/scripts/sync-window.mjs 生成，请勿手改（要改请改上游 dsh-watch-together）
+"""真正悬浮窗：不铺全屏背景图，实时抓取窗口背后的桌面并模糊。
+
+关键点：
+- Windows 10 2004+ 的 SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)：
+  让本窗口从屏幕捕获里消失，于是抓自己所在区域时抓到的是“背后的桌面”，
+  不会抓到自己，不会递归，也不需要全屏置顶图片。
+- 抓到的背景每 ~100ms 更新一次，所以是实时模糊，不是静态截图。
+- 这不是 DWM Acrylic；Acrylic 需要系统“透明效果”开启。这里是软件实时模糊。
+"""
+import ctypes
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+from ctypes import wintypes
+from pathlib import Path
+
+# 必须在 import tkinter / 创建任何窗口之前声明 per-monitor v2 DPI 感知。
+_u = ctypes.windll.user32
+try:
+    _u.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+    _u.SetProcessDpiAwarenessContext.restype = ctypes.c_bool
+    _u.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+except Exception:
+    pass
+
+try:
+    ctypes.windll.winmm.timeBeginPeriod(1)
+except Exception:
+    pass
+
+import tkinter as tk
+import tkinter.font as tkfont
+import mss
+import numpy as np
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageStat, ImageTk
+
+try:
+    import cv2 as _cv2
+except Exception:  # OpenCV 只是加速，缺了仍走 PIL
+    _cv2 = None
+
+# 悬浮窗接口：插件写 window-events.jsonl，窗口回 window-outbox.jsonl。
+# 读不到就继续读 chat.jsonl，旧版插件不受影响。
+try:
+    from window_protocol import WindowProtocol
+except Exception:
+    WindowProtocol = None
+
+W, H, R = 760, 560, 58
+MIN_W, MIN_H = 480, 420
+BAR_FRAC = 0.55
+BAR_Y = 20
+BAR_THICK = 4
+KEY = "#010203"
+FONT = "Microsoft YaHei UI"
+INTERVAL_MS = 4
+MAX_FPS = 120
+PAD = 40
+BAND = 64          # 全分辨率下的透镜带宽度
+AMP = 30           # 全分辨率下的最大采样偏移
+FORCE = os.environ.get("GLASS_FORCE") == "1"
+# 仅用于文档截图/CI 视觉检查：暂停抓屏并把 WDA 关掉，窗口才会出现在截图里
+PREVIEW = os.environ.get("DSH_GLASS_PREVIEW") == "1"
+# 文档截图：正常抓屏 2.5 秒后暂停并取消 WDA，保留最后一帧玻璃
+SNAPSHOT = os.environ.get("DSH_GLASS_SNAPSHOT") == "1"
+
+# 和 window.py 用同一份聊天流 / 配置，两个窗口可以同时开，看到的是同一条时间线
+HERE = Path(__file__).resolve().parent
+
+
+def cache_dir():
+    d = os.environ.get("DSH_VIDEO_CACHE_DIR")
+    if d:
+        return Path(d)
+    local = os.environ.get("LOCALAPPDATA")
+    if os.name == "nt" and local:
+        return Path(local) / "dsh-video-storyboard" / "cache"
+    return Path(os.environ.get("XDG_CACHE_HOME") or "~/.cache").expanduser() / "dsh-video-storyboard"
+
+
+CHAT_FILE = cache_dir() / "chat.jsonl"
+CONFIG = Path(os.environ.get("DSH_HOME") or os.path.expanduser("~/.dsh")) / "watch-window.json"
+MIC_SCRIPT = HERE / "mic.py"
+
+
+def read_config():
+    try:
+        return json.loads(CONFIG.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def write_config(patch):
+    cfg = read_config()
+    cfg.update(patch or {})
+    try:
+        CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CONFIG.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, CONFIG)
+    except Exception:
+        pass
+
+
+def append_user(text):
+    CHAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(CHAT_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"role": "user", "text": text, "at": int(time.time() * 1000)},
+                           ensure_ascii=False) + "\n")
+
+
+def clock(ms):
+    try:
+        return time.strftime("%H:%M:%S", time.localtime(float(ms) / 1000.0))
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def asr_python():
+    """和 window.py 一样：麦克风用 ASR 的 Python，不是带 tkinter 的这个。"""
+    for key in ("DSH_ASR_PYTHON", "DSH_FLOAT_PYTHON"):
+        v = os.environ.get(key)
+        if v:
+            return v
+    if os.name == "nt":
+        return "python.exe"
+    return "python3"
+
+
+def f(size, bold=False):
+    return (FONT, size, "bold") if bold else (FONT, size)
+
+
+def display_hz():
+    """显示器刷新率；240Hz 屏也照实返回，但软件管线不会硬追 240。"""
+    try:
+        u = ctypes.windll.user32
+        g = ctypes.windll.gdi32
+        dc = u.GetDC(0)
+        hz = int(g.GetDeviceCaps(dc, 116))
+        u.ReleaseDC(0, dc)
+        return hz if hz > 0 else 60
+    except Exception:
+        return 60
+
+
+def slabs_for(w, h):
+    """仓库那种三块玻璃：标题栏 / 主体 / 输入栏，中间留透明缝。"""
+    out, gap = 12, 10
+    top_h, bot_h = 54, 70
+    top = (out, out, w - out, out + top_h)
+    bot = (out, h - out - bot_h, w - out, h - out)
+    body = (out, top[3] + gap, w - out, bot[1] - gap)
+    return top, body, bot
+
+
+def chat_layout(h):
+    """消息区在高度不足 560 时压缩行高；底部输入框始终贴底。"""
+    input_top = h - 80
+    if h >= 560:
+        # 四条消息每条都能放下"时间头 + 两行正文"；f12 在 150% DPI 下
+        # 行高约 28px，82px 的框刚好装 2 行，不再为了塞下文字把字号压到 9。
+        ys, bh = [104, 198, 292, 386], 88
+    else:
+        # 顶部留 8px 空隙给最后一条和输入框，避免贴在一起
+        avail = max(0, input_top - 124 - 8)
+        bh = min(60, max(36, (avail - 24) // 4))
+        gap = max(8, (avail - 4 * bh) // 3)
+        ys = [124 + i * (bh + gap) for i in range(4)]
+    return ys, bh, input_top
+
+
+def shapes_for(w, h):
+    """按窗口尺寸生成内部框位置；消息气泡的最终宽度由文字测量决定。"""
+    ys, bh, input_top = chat_layout(h)
+    # 这里只给消息区四个纵向槽位；_message_shapes() 会按文字收窄宽度和高度。
+    return [
+        (38, ys[0], w - 38, ys[0] + bh, 30),
+        (38, ys[1], w - 38, ys[1] + bh, 30),
+        (38, ys[2], w - 38, ys[2] + bh, 30),
+        (38, ys[3], w - 38, ys[3] + bh, 30),
+        (36, input_top, w - 146, input_top + 54, 27),
+        (w - 134, input_top, w - 36, input_top + 54, 27),
+    ]
+
+
+SHAPES = shapes_for(W, H)
+SHAPES_VERSION = 0
+
+
+def rounded_mask():
+    # 三块独立的玻璃；缝里保持透明，能透出桌面。
+    ss = 4
+    m = Image.new("L", (W * ss, H * ss), 0)
+    d = ImageDraw.Draw(m)
+    for x0, y0, x1, y1 in slabs_for(W, H):
+        d.rounded_rectangle((x0 * ss, y0 * ss, x1 * ss, y1 * ss),
+                            radius=22 * ss, fill=255)
+    return m.resize((W, H), Image.Resampling.LANCZOS)
+
+
+def build_overlay():
+    """只画气泡和输入控件；窗口本体不再加 tint / 高光 / 外圈。"""
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+
+    # 只给内部框轻微染色，不做描边；窗口本体仍然完全透明
+    tints = [
+        (235, 242, 255, 5),
+        (110, 175, 255, 14),
+        (235, 242, 255, 4),
+        (235, 242, 255, 4),
+        (235, 242, 255, 5),
+        (110, 175, 255, 12),
+    ]
+    for (x0, y0, x1, y1, r), fill in zip(SHAPES, tints):
+        d.rounded_rectangle((x0, y0, x1, y1), radius=r, fill=fill)
+    return layer
+
+
+def build_warp():
+    """半分辨率边缘位移图：真正采样“边界外”的背景，不是描边。
+
+    半径方向向外取样本，越靠近边偏移越大；到 BAND 内归零。
+    只在半分辨率算，成本约 1ms，放大后边缘会有真实的弯曲/压缩。
+    """
+    hw, hh = W // 4, H // 4
+    yy, xx = np.mgrid[0:hh, 0:hw].astype(np.float32)
+    r = R / 4.0
+    qx = np.abs(xx - hw / 2) - (hw / 2 - r)
+    qy = np.abs(yy - hh / 2) - (hh / 2 - r)
+    sdf = (np.hypot(np.maximum(qx, 0), np.maximum(qy, 0))
+           + np.minimum(np.maximum(qx, qy), 0) - r)
+    gy, gx = np.gradient(sdf)
+    n = np.maximum(np.hypot(gx, gy), 1e-6)
+    d = -sdf
+    t = np.clip(1.0 - d / (BAND / 4.0), 0.0, 1.0)
+    mag = (AMP / 4.0) * t * t
+    edge_mask = np.clip((BAND / 4.0 - d) / 1.5, 0.0, 1.0)
+    return xx + gx / n * mag, yy + gy / n * mag, edge_mask.astype(np.float32)
+
+
+MASK = rounded_mask()
+# color-key 透明不能用半透明边缘：半透明像素会和黑色 KEY 混合，形成四角黑边。
+# 用二值遮罩硬切，边缘像素保留自身颜色，不再与 KEY 混合。
+MASK_HARD = MASK.point(lambda v: 255 if v >= 128 else 0)
+OVERLAY = build_overlay()
+# 染色层在 1/4 分辨率合成，避免每帧对 760x560 做一次 alpha_composite
+OVERLAY_2X = OVERLAY.resize((W // 2, H // 2), Image.Resampling.BILINEAR)
+
+# 用你给的麦克风图：去背景得到 alpha，再分别做浅色/深色两版
+MIC_POS = (53, H - 67)
+MIC_MASK = Image.open(Path(__file__).with_name("mic-dsh.png")).convert("L")
+MIC_MASK = MIC_MASK.resize((28, 28), Image.Resampling.LANCZOS)
+MIC_LIGHT = Image.new("RGBA", MIC_MASK.size, (235, 244, 255, 0))
+MIC_LIGHT.putalpha(MIC_MASK)
+MIC_DARK = Image.new("RGBA", MIC_MASK.size, (24, 48, 72, 0))
+MIC_DARK.putalpha(MIC_MASK)
+WARP_X, WARP_Y, EDGE_MASK = build_warp()
+
+# 内部框体：气泡 + 输入框 + 发送。透镜在 1/4 分辨率算，染色用全分辨率遮罩。
+BOX_BAND = 7      # 1/4 分辨率下的折射带
+BOX_AMP = 8       # 1/4 分辨率下的最大采样偏移
+
+
+
+def build_box_maps():
+    out = []
+    for x0, y0, x1, y1, r in SHAPES:
+        if x1 <= x0 or y1 <= y0:
+            continue
+        qx0, qy0 = x0 // 4, y0 // 4
+        qw, qh = max(2, (x1 - x0) // 4), max(2, (y1 - y0) // 4)
+        xx, yy = np.meshgrid(np.arange(qw, dtype=np.float32),
+                             np.arange(qh, dtype=np.float32))
+        rr = r / 4.0
+        cx, cy = qw / 2.0, qh / 2.0
+        qx = np.abs(xx - cx) - (cx - rr)
+        qy = np.abs(yy - cy) - (cy - rr)
+        sdf = (np.hypot(np.maximum(qx, 0), np.maximum(qy, 0))
+               + np.minimum(np.maximum(qx, qy), 0) - rr)
+        gy, gx = np.gradient(sdf)
+        n = np.maximum(np.hypot(gx, gy), 1e-6)
+        d = -sdf
+        alpha = np.clip((d + 0.6) / 1.2, 0.0, 1.0).astype(np.float32)
+        t = np.clip(1.0 - d / BOX_BAND, 0.0, 1.0)
+        mag = BOX_AMP * t * t
+        sx = np.rint(qx0 + xx + gx / n * mag).astype(np.int32)
+        sy = np.rint(qy0 + yy + gy / n * mag).astype(np.int32)
+        np.clip(sx, 0, W // 4 - 1, out=sx)
+        np.clip(sy, 0, H // 4 - 1, out=sy)
+        # 边缘到中心用平滑权重过渡，不再用二值 edge 在“原始帧”和
+        # “强模糊帧”之间硬切；系数不一致会看到一圈割裂。
+        w = np.clip(d / BOX_BAND, 0.0, 1.0).astype(np.float32)
+        w = (w * w * (3.0 - 2.0 * w)).astype(np.float32)
+        out.append((qx0, qy0, qw, qh, alpha, w, sx, sy))
+    return out
+
+
+BOX_MAPS = build_box_maps()
+
+
+def build_box_union(ow, oh):
+    """目标分辨率下的圆角联合遮罩，4x 超采样后缩小，边界平滑。"""
+    ss = 4
+    fx, fy = ow / W, oh / H
+    m = Image.new("L", (ow * ss, oh * ss), 0)
+    d = ImageDraw.Draw(m)
+    for x0, y0, x1, y1, r in SHAPES:
+        d.rounded_rectangle((x0 * fx * ss, y0 * fy * ss,
+                             x1 * fx * ss, y1 * fy * ss),
+                            radius=r * min(fx, fy) * ss, fill=255)
+    return m.resize((ow, oh), Image.Resampling.LANCZOS)
+
+
+HW, HH = W // 2, H // 2
+BOX_UNION_2X = build_box_union(HW, HH)
+
+
+def rebuild_geometry(w, h):
+    """窗口尺寸变化后重建所有和 W/H 绑定的贴图/遮罩。"""
+    global W, H, SHAPES, MASK, MASK_HARD, OVERLAY, OVERLAY_2X
+    global WARP_X, WARP_Y, EDGE_MASK, BOX_MAPS, HW, HH, BOX_UNION_2X, MIC_POS
+    _CHROMA_CACHE.clear()  # 旧尺寸的索引图不再用，避免每次缩放都攒一份
+    W, H = w, h
+    SHAPES = shapes_for(w, h)
+    MASK = rounded_mask()
+    MASK_HARD = MASK.point(lambda v: 255 if v >= 128 else 0)
+    OVERLAY = build_overlay()
+    OVERLAY_2X = OVERLAY.resize((W // 2, H // 2), Image.Resampling.BILINEAR)
+    MIC_POS = (53, H - 67)
+    WARP_X, WARP_Y, EDGE_MASK = build_warp()
+    BOX_MAPS = build_box_maps()
+    HW, HH = W // 2, H // 2
+    BOX_UNION_2X = build_box_union(HW, HH)
+
+
+def apply_shapes(shapes):
+    """消息气泡宽度/高度变化后，只重建和内部框有关的贴图。
+
+    窗口尺寸不变，所以不用碰 WARP/MASK；只更新染色层、四分之一透镜
+    坐标和 2x 联合遮罩。调用方负责持有 _geo_lock。
+    """
+    global SHAPES, OVERLAY, OVERLAY_2X, BOX_MAPS, BOX_UNION_2X, SHAPES_VERSION
+    SHAPES = list(shapes)
+    OVERLAY = build_overlay()
+    OVERLAY_2X = OVERLAY.resize((W // 2, H // 2), Image.Resampling.BILINEAR)
+    BOX_MAPS = build_box_maps()
+    BOX_UNION_2X = build_box_union(HW, HH)
+    SHAPES_VERSION += 1
+
+
+def finish(panel):
+    """只做圆角遮罩；染色已经在 1/4 分辨率合成过。"""
+    out = Image.new("RGB", (W, H), KEY)
+    out.paste(panel.convert("RGB"), (0, 0), MASK_HARD)
+    return out
+
+
+def _smoothstep(a, b, x):
+    t = np.clip((x - a) / (b - a), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+_CHROMA_CACHE = {}
+
+
+def _chroma_maps(w, h, strength):
+    """2x 色散索引图只跟尺寸/强度走，缓存后每帧只做 gather。"""
+    key = (w, h, round(float(strength), 2))
+    hit = _CHROMA_CACHE.get(key)
+    if hit is not None:
+        return hit
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    dx = (xx + 0.5) / w - 0.5
+    dy = (yy + 0.5) / h - 0.5
+    r = np.hypot(dx, dy) + 1e-6
+    edge = _smoothstep(0.38, 0.48, r) * (1.0 - _smoothstep(0.52, 0.585, r))
+    k = strength * edge
+    ox = np.rint(dx / r * k).astype(np.int32)
+    oy = np.rint(dy / r * k).astype(np.int32)
+    xi = xx.astype(np.int32)
+    yi = yy.astype(np.int32)
+    hit = (
+        edge.astype(np.float32),
+        np.clip(xi + ox, 0, w - 1),
+        np.clip(yi + oy, 0, h - 1),
+        np.clip(xi - ox, 0, w - 1),
+        np.clip(yi - oy, 0, h - 1),
+    )
+    _CHROMA_CACHE[key] = hit
+    return hit
+
+
+def apply_chroma(im, strength=1.7):
+    """外框径向色散：R 向外、B 向内错一位，和 GPU 后处理同一思路。
+
+    只在圆角外缘的窄带里做，且按 edge 权重混回原图；否则整张图会变成
+    红蓝重影。CPU 版在 2x 合成图上做，成本远低于全分辨率逐像素采样。
+    """
+    arr = np.asarray(im.convert("RGB"), dtype=np.float32)
+    h, w = arr.shape[:2]
+    edge, xr, yr, xb, yb = _chroma_maps(w, h, strength)
+    if not np.any(edge > 0.001):
+        return im
+    rr = arr[yr, xr, 0]
+    bb = arr[yb, xb, 2]
+    out = arr.copy()
+    out[:, :, 0] = arr[:, :, 0] * (1.0 - edge) + rr * edge
+    out[:, :, 2] = arr[:, :, 2] * (1.0 - edge) + bb * edge
+    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class LiveGlass:
+    def __init__(self):
+        global W, H
+        cfg = read_config()
+        raw_name = cfg.get("name")
+        self.name = (raw_name.strip()[:24] if isinstance(raw_name, str) and raw_name.strip()
+                     else "陪看")
+        self.messages = []
+        self._msg_offset = 0
+        self._file_pos = 0
+        self._file_size = -1
+        self._chat_after = None
+        self._mic_proc = None
+        self._status = ""
+        self._cfg_key = None
+        self._hidden = False
+        self._protocol = WindowProtocol() if WindowProtocol is not None else None
+        self._seen = set()
+        self._collapsed = False
+        self._saved_h = H
+        self._snapshot_done = False
+        # 只在双击标题时创建，平时不占画布
+        self._title_entry = None
+        self._title_item = None
+        self._editing = False
+
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.overrideredirect(True)
+        self.root.title(self.name)
+        self.root.attributes("-topmost", True)
+        self.root.configure(bg=KEY)
+        self.root.attributes("-transparentcolor", KEY)
+
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        self._sw, self._sh = sw, sh
+        # 默认比旧窗宽一点；有 geometry 就恢复，但尺寸仍在玻璃引擎的可用范围内
+        self._parse_geometry(cfg.get("geometry") if isinstance(cfg.get("geometry"), str) else "")
+        # 入场：从下方 22px 滑上来（不碰 -alpha，避免和抠色冲突）。
+        self._intro_target_y = self._y
+        self._intro_y = self._y + 22
+        self.root.geometry(f"{W}x{H}+{self._x}+{self._intro_y}")
+        rebuild_geometry(W, H)
+
+        self.canvas = tk.Canvas(self.root, width=W, height=H, bg=KEY,
+                                highlightthickness=0, bd=0)
+        self.canvas.pack(fill="both", expand=True)
+
+        self._img = None
+        self._last_frame = None
+        self._prev_out = None
+        self._motion_blur = 0.0
+        self._collapsed_frame = None
+        self._bg = None
+        self._hwnd = None
+        self._excluded = False
+        self._drag = None
+        self._resize = None
+        self._preview_at = 0.0
+        self._geo_lock = threading.Lock()
+        self._q = queue.Queue(maxsize=1)
+        self._stop = threading.Event()
+        self._pause = threading.Event()
+        self._worker = threading.Thread(target=self._work, daemon=True)
+        self._hz = display_hz()
+        self._target_fps = min(MAX_FPS, self._hz)
+        self._sig = None
+        self._sig_bbox = None
+        self._ema = 1.0 / max(1, self._target_fps)
+        self._frames = 0
+        self._text_items = []
+        self._text_colors = {}
+        self._text_pending = {}
+        self._text_shadows = {}
+        self._color_at = 0.0
+        self._aux_at = 0.0
+        self._bar_color = "#b8cbe0"
+        self._load_initial()
+        self._build_ui()
+        self._add_text_shadows()
+
+        self.root.deiconify()
+        self.root.update_idletasks()
+        shadow_ids = {sid for ids in self._text_shadows.values() for sid in ids}
+        self._text_items = [i for i in self.canvas.find_all()
+                            if self.canvas.type(i) == "text"
+                            and i not in shadow_ids]
+        self._set_exclude(os.environ.get("DSH_GLASS_WDA") != "0")
+        self._worker.start()
+        self.root.lift()
+        self.root.after(80, self.root.lift)
+        self.root.after(120, self.root.focus_set)
+        self.root.after(60, self._tick)
+        self.root.after(30, lambda: self._intro_step(0))
+        self.root.after(250, self._poll_chat)
+        self.root.after(1200, self._keep_on_top)
+        if SNAPSHOT:
+            self.root.after(2600, self._snapshot_mode)
+
+    def _intro_step(self, n):
+        """窗口入场：6 步滑到保存的位置，之后完全交给用户拖动。"""
+        try:
+            if n >= 6:
+                self._y = self._intro_target_y
+            else:
+                self._y = self._intro_target_y + int(22 * (1 - (n + 1) / 6.0))
+            self.root.geometry(f"{W}x{H}+{self._x}+{self._y}")
+        except Exception:
+            pass
+        if n < 6:
+            self.root.after(26, lambda: self._intro_step(n + 1))
+
+    def _keep_on_top(self):
+        """DSH 等置顶窗口被激活后会把悬浮窗压下去；定时重新抬到最上层。"""
+        try:
+            if not getattr(self, "_hidden", False):
+                self.root.attributes("-topmost", True)
+                self.root.lift()
+        except Exception:
+            pass
+        try:
+            self.root.after(1800, self._keep_on_top)
+        except Exception:
+            pass
+
+    # ---- 真实聊天流 ----
+
+    def _parse_geometry(self, geo):
+        global W, H
+        sw, sh = self._sw, self._sh
+        w, h, x, y = W, H, max(40, sw - W - 80), max(40, (sh - H) // 2 - 40)
+        try:
+            size, rest = geo.split("+", 1)
+            pw, ph = (int(v) for v in size.split("x"))
+            px, py = (int(v) for v in rest.split("+")[:2])
+            w = max(MIN_W, min(sw - 40, pw))
+            h = max(MIN_H, min(sh - 40, ph))
+            x = max(0, min(sw - w, px))
+            y = max(0, min(sh - h, py))
+        except Exception:
+            pass
+        W, H = w, h
+        self._x, self._y = x, y
+
+    def _load_initial(self):
+        self.messages = []
+        self._seen.clear()
+        self._file_pos = 0
+        try:
+            lines = CHAT_FILE.read_text(encoding="utf-8").splitlines()[-80:]
+            for line in lines:
+                self._append_message(self._parse_message(line))
+            self._file_pos = CHAT_FILE.stat().st_size
+        except Exception:
+            self._file_pos = 0
+        self._file_size = self._file_pos
+        self._msg_offset = 0
+        self._replay_protocol()
+
+    @staticmethod
+    def _parse_message(line):
+        line = (line or "").strip()
+        if not line:
+            return None
+        try:
+            raw = json.loads(line)
+        except Exception:
+            return None
+        text = raw.get("text")
+        role = raw.get("role") or ("meta" if raw.get("type") == "meta" else "assistant")
+        # meta 行是宿主/麦克风状态（叫醒失败、录音状态），不是聊天内容：不进气泡，
+        # 放到标题栏下面那行状态里，别把四条消息挤掉。
+        if role == "meta":
+            return {"role": "meta", "text": str(text or ""),
+                    "stamp": "", "at": raw.get("at")}
+        if not isinstance(text, str) or not text:
+            return None
+        return {"role": role,
+                "text": text,
+                "stamp": clock(raw.get("at")) if raw.get("at") is not None else "",
+                "at": raw.get("at")}
+
+    def _append_message(self, msg):
+        if not msg:
+            return False
+        key = (msg.get("role"), msg.get("text"), msg.get("at"))
+        if key in self._seen:
+            return False
+        self._seen.add(key)
+        if len(self._seen) > 2000:
+            self._seen = set(list(self._seen)[-1200:])
+        if msg.get("role") == "meta":
+            self._status = str(msg.get("text") or "")[:80]
+            return True
+        self.messages.append(msg)
+        self.messages = self.messages[-200:]
+        return True
+
+    # ---- 窗口接口 ----
+
+    def _render_event(self, event):
+        if not isinstance(event, dict):
+            return
+        kind = event.get("type")
+        if kind in ("message", "meta"):
+            self._append_message(self._parse_message(json.dumps(event, ensure_ascii=False)))
+            self._refresh_feed()
+        elif kind == "control":
+            self._apply_control(event)
+
+    def _apply_control(self, event):
+        action = str(event.get("action") or "")
+        value = event.get("value")
+        try:
+            if action == "rename" and str(value or "").strip():
+                self.name = str(value).strip()[:24]
+                self.root.title(self.name)
+                write_config({"name": self.name})
+                self._refresh_feed()
+            elif action == "collapse" and not self._collapsed:
+                self.toggle_collapse()
+            elif action == "expand" and self._collapsed:
+                self.toggle_collapse()
+            elif action == "hide":
+                self._hidden = True
+                write_config({"hidden": True})
+                self.root.withdraw()
+            elif action == "show":
+                self._hidden = False
+                write_config({"hidden": False})
+                self.root.deiconify()
+                self.root.attributes("-topmost", True)
+        except Exception:
+            pass
+
+    def _replay_protocol(self):
+        if self._protocol is None:
+            return
+        try:
+            for event in self._protocol.reset_events(60):
+                self._render_event(event)
+        except Exception:
+            pass
+
+    def _drain_protocol(self):
+        if self._protocol is None:
+            return []
+        try:
+            return self._protocol.read_events()
+        except Exception:
+            return []
+
+    def _poll_chat(self):
+        try:
+            self._sync_visible()
+            # 新接口优先；chat.jsonl 仍然读，兼容旧版插件/浏览器页。
+            for event in self._drain_protocol():
+                self._render_event(event)
+            if self._mic_proc is not None and self._mic_proc.poll() is not None:
+                self._mic_proc = None
+                self._status = ""
+                self._refresh_feed()
+            try:
+                size = CHAT_FILE.stat().st_size
+            except OSError:
+                size = 0
+            if size < self._file_pos:
+                self._load_initial()
+                self._refresh_feed()
+            elif size > self._file_pos:
+                new = []
+                with open(CHAT_FILE, "r", encoding="utf-8") as f:
+                    f.seek(self._file_pos)
+                    data = f.read()
+                    self._file_pos = f.tell()
+                for line in data.splitlines():
+                    msg = self._parse_message(line)
+                    if msg:
+                        new.append(msg)
+                changed = False
+                for msg in new:
+                    if self._append_message(msg):
+                        changed = True
+                if changed:
+                    if self._msg_offset > 0:
+                        self._msg_offset += len(new)
+                    self._msg_offset = max(0, min(self._msg_offset, max(0, len(self.messages) - 4)))
+                    self._refresh_feed()
+            self._file_size = size
+        except Exception as exc:
+            print("chat poll error", exc, flush=True)
+        if not self._stop.is_set():
+            self._chat_after = self.root.after(250, self._poll_chat)
+
+    def _sync_visible(self):
+        try:
+            st = CONFIG.stat()
+            key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            key = None
+        if key == self._cfg_key:
+            return
+        self._cfg_key = key
+        want = bool(read_config().get("hidden"))
+        if want == self._hidden:
+            return
+        self._hidden = want
+        try:
+            if want:
+                self.root.withdraw()
+            else:
+                self.root.deiconify()
+                self.root.attributes("-topmost", True)
+                self.root.lift()
+        except Exception:
+            self._hidden = not want
+
+    def _visible_messages(self):
+        total = len(self.messages)
+        visible = min(4, total)
+        start = max(0, total - visible - self._msg_offset)
+        return self.messages[start:start + visible]
+
+    def _refresh_feed(self):
+        """聊天流变了就重画文字；Entry 的草稿和焦点要保住。"""
+        if not hasattr(self, "canvas"):
+            return
+        self._build_ui()
+        self._text_items = [i for i in self.canvas.find_all()
+                            if self.canvas.type(i) == "text"]
+        if self._last_frame is not None:
+            try:
+                self._img = ImageTk.PhotoImage(self._last_frame, master=self.canvas)
+                self.canvas.itemconfigure(self._bg, image=self._img)
+                self.canvas.tag_lower(self._bg)
+                self._color_at = 0.0
+                self._aux_at = 0.0
+                self._adapt_text(self._last_frame)
+                self._adapt_aux(self._last_frame)
+            except Exception:
+                pass
+    def _send(self, _event=None):
+        try:
+            text = self.entry.get().strip()
+        except Exception:
+            return "break"
+        if not text:
+            return "break"
+        try:
+            append_user(text)
+        except Exception as exc:
+            self._status = f"写不进去：{exc}"
+            self._refresh_feed()
+            return "break"
+        try:
+            self.entry.delete(0, "end")
+        except Exception:
+            pass
+        try:
+            if self._protocol is not None:
+                self._protocol.action("say", text=text)
+        except Exception:
+            pass
+        self._render_input()
+        self.root.after(40, self._poll_chat)
+        return "break"
+
+    def _wheel(self, e):
+        if not self.messages:
+            return
+        step = 1 if e.delta > 0 else -1
+        max_off = max(0, len(self.messages) - 4)
+        self._msg_offset = max(0, min(max_off, self._msg_offset + step))
+        self._refresh_feed()
+
+    def _toggle_mic(self):
+        if self._mic_proc is not None and self._mic_proc.poll() is None:
+            self._stop_mic()
+            return
+        if not MIC_SCRIPT.exists():
+            self._status = "找不到 mic.py"
+            self._refresh_feed()
+            return
+        try:
+            self._mic_proc = subprocess.Popen(
+                [asr_python(), str(MIC_SCRIPT), "--engine", "local"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=0x08000000 if os.name == "nt" else 0,
+            )
+            self._status = "录音中"
+        except Exception as exc:
+            self._status = f"麦起不来：{exc}"
+        self._refresh_feed()
+
+    def _stop_mic(self):
+        p = self._mic_proc
+        self._mic_proc = None
+        self._status = ""
+        if p is not None and p.poll() is None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        self._refresh_feed()
+
+    def _make_collapsed_frame(self):
+        """折叠时只保留标题栏那一块玻璃，并补上圆角。
+
+        直接裁 _last_frame 会让底部变成一条硬切边（遮罩还是 560px 高），
+        看起来像渲染坏了；这里按 78px 重新贴一次圆角遮罩。
+        """
+        if self._last_frame is None:
+            return None
+        try:
+            w, h = W, H
+            crop = self._last_frame.convert("RGB").crop((0, 0, w, h))
+            mask = Image.new("L", (w, h), 0)
+            d = ImageDraw.Draw(mask)
+            d.rounded_rectangle((12, 12, w - 12, 66), radius=22, fill=255)
+            out = Image.new("RGB", (w, h), KEY)
+            out.paste(crop, (0, 0), mask)
+            return out
+        except Exception:
+            return None
+
+    def _sync_pos(self):
+        """把 Tk 当前左上角同步回 _x/_y。
+
+        拖动/缩放只改了 root.geometry，没有改这两个缓存；折叠时如果继续用
+        旧坐标，窗口会被拉回拖动前的位置（用户看到的就是"点收起位置跳回"）。
+        """
+        try:
+            self._x = int(self.root.winfo_x())
+            self._y = int(self.root.winfo_y())
+        except Exception:
+            pass
+
+    def _save_geometry(self):
+        # 折叠态存回展开高度，否则下次启动会按 78px 的高度恢复。
+        h = getattr(self, "_saved_h", H) if getattr(self, "_collapsed", False) else self.root.winfo_height()
+        write_config({"geometry": f"{self.root.winfo_width()}x{h}"
+                                  f"+{self.root.winfo_x()}+{self.root.winfo_y()}"})
+
+    def _hwnd_root(self):
+        if self._hwnd is None:
+            self._hwnd = ctypes.windll.user32.GetAncestor(self.root.winfo_id(), 2)
+        return self._hwnd
+
+    def _set_exclude(self, on):
+        hwnd = self._hwnd_root()
+        fn = ctypes.windll.user32.SetWindowDisplayAffinity
+        fn.argtypes = [wintypes.HWND, wintypes.DWORD]
+        fn.restype = wintypes.BOOL
+        ok = bool(fn(hwnd, 0x11 if on else 0))
+        self._excluded = ok and on
+        if not ok:
+            print("WDA failed", ctypes.GetLastError(), flush=True)
+
+    def _bbox(self):
+        hwnd = self._hwnd_root()
+        rc = RECT()
+        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rc))
+        return (rc.left, rc.top, rc.right, rc.bottom)
+
+    def _capture(self, sct):
+        l, t, r, b = self._bbox()
+        if r <= l or b <= t:
+            return None
+        # 多抓一圈，边缘透镜才能取到“框外”的背景
+        gl = max(0, l - PAD)
+        gt = max(0, t - PAD)
+        gr = min(self._sw, r + PAD)
+        gb = min(self._sh, b + PAD)
+        # 防御：多显示器 / DPI 变化 / 被其他程序挪动时，窗口仍可能越界，
+        # 钳位后宽高会变成 0 或负数，mss 会抛 "Region has zero or negative size"；
+        # 那个异常在 _work() 里被吞掉只打一行日志，于是每帧刷一条、背景永远画不出来。
+        if gr - gl <= 0 or gb - gt <= 0:
+            return None
+        shot = sct.grab({"left": gl, "top": gt,
+                         "width": gr - gl, "height": gb - gt})
+        im = Image.frombytes("RGB", shot.size, shot.rgb)
+        sw4, sh4 = max(2, (gr - gl) // 4), max(2, (gb - gt) // 4)
+        # 60fps 路径：只在 1/4 分辨率做一次模糊和折射，再放大。
+        # cv2 的 resize 比 PIL 快一个数量级；没有 OpenCV 时无感回退。
+        if _cv2 is not None:
+            arr_raw = _cv2.resize(np.asarray(im), (sw4, sh4),
+                                  interpolation=_cv2.INTER_LINEAR)
+            small_raw = Image.fromarray(arr_raw)
+        else:
+            small_raw = im.resize((sw4, sh4), Image.Resampling.BILINEAR)
+            arr_raw = np.asarray(small_raw)
+        # 静态跳帧：先用未模糊的 raw 判断，静止时连模糊都不用做。
+        # 采样 4px、均值 0.01 + 最大差 0.5、运动后保持 0.3s；比原来的
+        # 8px / 0.18 更早触发，慢速滚动不会先停一两帧再动。
+        sig = arr_raw[::4, ::4].astype(np.int16).mean(axis=2)
+        box = (gl, gt, gr, gb)
+        now = time.perf_counter()
+        moved = False
+        if self._sig is not None and box == self._sig_bbox and sig.shape == self._sig.shape:
+            d = np.abs(sig - self._sig)
+            moved = bool(float(d.mean()) > 0.01 or float(d.max()) > 0.5)
+        if moved:
+            self._last_motion = now
+            self._motion_blur = min(1.0, getattr(self, "_motion_blur", 0.0) * 0.50 + 0.50)
+        else:
+            self._motion_blur = getattr(self, "_motion_blur", 0.0) * 0.55
+        if (not FORCE and not moved and box == self._sig_bbox
+                and now - getattr(self, "_last_motion", 0.0) > 0.30):
+            self._sig = sig
+            # 静态跳帧期间不更新画面；上一帧若带着运动模糊，绝不能在
+            # 很久以后重新移动时再被混进来，否则就是“淡淡的旧画面”。
+            self._prev_out = None
+            return None
+        self._sig = sig
+        self._sig_bbox = box
+        small = small_raw.filter(ImageFilter.GaussianBlur(1.45))
+        strong = small.filter(ImageFilter.GaussianBlur(2.6))
+        arr = np.asarray(small)
+        arr_strong = np.asarray(strong)
+        px = int(round((l - gl) / 4.0))
+        py = int(round((t - gt) / 4.0))
+        sx = np.rint(WARP_X + px).astype(np.int32)
+        sy = np.rint(WARP_Y + py).astype(np.int32)
+        np.clip(sx, 0, arr.shape[1] - 1, out=sx)
+        np.clip(sy, 0, arr.shape[0] - 1, out=sy)
+        warped = arr[sy, sx]
+        # 内部框：边缘折射 + 中心强模糊仍在 1/4 分辨率完成
+        strong_panel = arr_strong[sy, sx]
+        out_panel = warped.copy()
+        for qx0, qy0, qw, qh, alpha, edge_w, bsx, bsy in BOX_MAPS:
+            base_patch = warped[qy0:qy0 + qh, qx0:qx0 + qw]
+            # 边缘也用和主玻璃相同的 1.45 模糊，不再直接拿未模糊的
+            # arr_raw；中心再平滑过渡到 2.6 的强模糊。
+            edge_patch = arr[np.clip(bsy + py, 0, arr.shape[0] - 1),
+                             np.clip(bsx + px, 0, arr.shape[1] - 1)]
+            strong_patch = strong_panel[qy0:qy0 + qh, qx0:qx0 + qw]
+            we = edge_w[..., None]
+            patch = edge_patch * (1.0 - we) + strong_patch * we
+            a = alpha[..., None]
+            out_panel[qy0:qy0 + qh, qx0:qx0 + qw] = (
+                base_patch * (1.0 - a) + patch * a)
+        # 1/4 透镜结果放大后，用全分辨率联合圆角遮罩贴回；
+        # 边界是 PIL 4x 超采样遮罩，不再有 1/4 放大的像素台阶。
+        # 2x 合成：比全分辨率轻，比 1/4 明显平滑，兼顾帧率和圆角
+        if _cv2 is not None:
+            base_2x = Image.fromarray(_cv2.resize(
+                warped, (HW, HH), interpolation=_cv2.INTER_LINEAR))
+            lens_2x = Image.fromarray(_cv2.resize(
+                out_panel, (HW, HH), interpolation=_cv2.INTER_LINEAR))
+        else:
+            base_2x = Image.fromarray(warped).resize(
+                (HW, HH), Image.Resampling.BILINEAR)
+            lens_2x = Image.fromarray(out_panel).resize(
+                (HW, HH), Image.Resampling.BILINEAR)
+        panel = Image.composite(lens_2x, base_2x, BOX_UNION_2X)
+        panel = Image.alpha_composite(
+            panel.convert("RGBA"), OVERLAY_2X).convert("RGB")
+        # 2x 上做一次显式 R/B 错位；全分辨率逐像素做会把这个 60fps 管线拖慢。
+        # 移动中跳过色散（约 3.5ms/帧），优先保证拖动/滚动响应；停下后
+        # 的静止帧再补上，最终观感不变。
+        if not moved:
+            panel = apply_chroma(panel, 1.7)
+        if _cv2 is not None:
+            out = Image.fromarray(_cv2.resize(
+                np.asarray(panel.convert("RGB")), (W, H),
+                interpolation=_cv2.INTER_LINEAR))
+        else:
+            out = panel.convert("RGB").resize((W, H), Image.Resampling.BILINEAR)
+        # CPU 也做上一帧混合，但比 GPU 的 0.55 轻、且只在检测到移动时混：
+        # 拖动停下后立刻恢复清晰，不会留下淡淡的旧画面。
+        # 先混再贴麦克风，避免把上一帧的麦克风位置糊到这一帧。
+        if moved and self._prev_out is not None and self._prev_out.size == out.size:
+            # 只在“这一帧确实检测到移动”时混上一帧；停下后下一帧
+            # 立刻干净，不会留下越拖越淡的残影。
+            blend = 0.35 * max(0.0, min(1.0, getattr(self, "_motion_blur", 0.0)))
+            if blend > 0.01:
+                out = Image.blend(self._prev_out, out, blend)
+        self._prev_out = out.copy()
+        # 麦克风图标回到仓库的做法：贴进玻璃帧，按背后亮度选浅/深两版。
+        # 位置用 MIC_POS（左上角），不是 Canvas 坐标，缩放时一起重建。
+        mic_box = out.crop((MIC_POS[0], MIC_POS[1],
+                            MIC_POS[0] + 28, MIC_POS[1] + 28)).convert("L")
+        mic_bg = float(np.median(np.asarray(mic_box))) / 255.0
+        out = out.convert("RGBA")
+        icon = MIC_LIGHT if mic_bg < 0.48 else MIC_DARK
+        out.paste(icon, MIC_POS, icon)
+        return finish(out.convert("RGB"))
+
+    def _work(self):
+        """抓取 + 模糊 + 合成全在后台，主线程只负责显示最新一帧。"""
+        idle = 0
+        with mss.MSS() as sct:
+            while not self._stop.is_set():
+                if self._pause.is_set():
+                    time.sleep(0.03)
+                    continue
+                if getattr(self, "_collapsed", False):
+                    # 折叠态只剩一条标题栏，玻璃遮罩仍是展开时的尺寸；继续抓会在
+                    # 合成时抛 images do not match（每帧一条，能把日志刷到几十 MB）。
+                    time.sleep(0.05)
+                    continue
+                t0 = time.perf_counter()
+                try:
+                    with self._geo_lock:
+                        out = self._capture(sct)
+                    if out is not None:
+                        idle = 0
+                        try:
+                            self._q.get_nowait()
+                        except queue.Empty:
+                            pass
+                        self._q.put(out)
+                    else:
+                        idle += 1
+                except Exception as exc:
+                    print("capture error", exc, flush=True)
+                dt = time.perf_counter() - t0
+                self._ema = self._ema * 0.9 + dt * 0.1
+                if FORCE:
+                    self._target_fps = MAX_FPS
+                elif self._ema > 0.026:
+                    self._target_fps = 45
+                elif self._ema > 0.016:
+                    self._target_fps = 60
+                elif self._ema > 0.011:
+                    self._target_fps = 90
+                else:
+                    self._target_fps = min(MAX_FPS, self._hz)
+                # 静态画面：跳过合成，但保留 60fps 探针，变化后 ~16ms 内响应
+                if idle > 20:
+                    time.sleep(max(0.016, 1 / max(1, self._target_fps) - dt))
+                else:
+                    time.sleep(max(0.0, 1 / max(1, self._target_fps) - dt))
+
+    def _fit_lines(self, text, font, max_width, max_height):
+        """按框宽/框高折行并截断，避免文字溢出气泡。"""
+        fobj = tkfont.Font(root=self.root, font=font)
+        ls = max(1, fobj.metrics("linespace"))
+        max_lines = max(1, int(max_height // ls))
+        lines = []
+        no_start = "，。、；：！？）》」』…,.;:!?)]}"
+        for para in str(text).splitlines() or [""]:
+            cur = ""
+            for ch in para:
+                if not cur or fobj.measure(cur + ch) <= max_width:
+                    cur += ch
+                elif ch in no_start:
+                    # 标点不能单独掉到下一行（会变成孤零零一个句号）
+                    cur += ch
+                else:
+                    lines.append(cur)
+                    cur = ch
+            lines.append(cur)
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            last = lines[-1]
+            while last and fobj.measure(last + "…") > max_width:
+                last = last[:-1]
+            lines[-1] = (last + "…") if last else "…"
+        return lines or [""]
+
+    def _text(self, x, y, text, anchor="center", fill="#f2f8ff",
+              font=None, max_width=None, tags=()):
+        """按字符拆成 Canvas 文本；每个字单独适配背后的明暗。"""
+        fobj = tkfont.Font(root=self.root, font=font)
+        measure = fobj.measure
+        linespace = fobj.metrics("linespace")
+        if max_width is not None:
+            lines, cur = [], ""
+            for ch in text:
+                if not cur or measure(cur + ch) <= max_width:
+                    cur += ch
+                else:
+                    lines.append(cur)
+                    cur = ch
+            lines.append(cur)
+        else:
+            lines = [text]
+        top_anchor = anchor in ("n", "nw", "ne")
+        right_anchor = anchor in ("e", "ne", "se")
+        center_anchor = anchor in ("center", "n", "s")
+        height = fobj.metrics("ascent") + fobj.metrics("descent")
+        for i, line in enumerate(lines):
+            lw = measure(line)
+            if right_anchor:
+                lx = x - lw
+            elif center_anchor:
+                lx = x - lw / 2
+            else:
+                lx = x
+            if top_anchor:
+                ly = y + i * linespace + height / 2
+            else:
+                ly = y + (i - (len(lines) - 1) / 2) * linespace
+            for i, ch in enumerate(line):
+                cx = lx + measure(line[:i])
+                self.canvas.create_text(cx, ly, text=ch, anchor="w",
+                                        fill=fill, font=font, tags=tags)
+
+    def _render_input(self):
+        """输入文字画在 Canvas 上；隐藏 Entry 只负责 IME/键盘。"""
+        if not hasattr(self, "entry") or self.entry is None:
+            return
+        c = self.canvas
+        c.delete("inputtext", "inputcursor")
+        try:
+            text = self.entry.get()
+            focused = self.root.focus_get() is self.entry
+        except Exception:
+            text, focused = "", False
+        x0, y0, x1, y1, _r = SHAPES[4]
+        x, y = x0 + 84, y0 + 27
+        maxw = max(60, x1 - x0 - 100)
+        if not text and not focused:
+            self._text(x, y, "在这里跟它说话…", anchor="w",
+                       fill="#8e9db2", font=f(11),
+                       tags=("inputtext", "inputzone"))
+        elif text:
+            fobj = tkfont.Font(root=self.root, font=f(11))
+            while text and fobj.measure(text) > maxw:
+                text = text[1:]
+            self._text(x, y, text, anchor="w", fill="#eef6ff",
+                       font=f(11), tags=("inputtext", "inputzone"))
+            if focused:
+                cx = x + fobj.measure(text)
+                c.create_line(cx + 1, y - 9, cx + 1, y + 9,
+                              fill="#b9d7ff", width=1, tags=("inputcursor",))
+        elif focused:
+            c.create_line(x + 1, y - 9, x + 1, y + 9,
+                          fill="#b9d7ff", width=1, tags=("inputcursor",))
+        self._text_items = [i for i in c.find_all() if c.type(i) == "text"]
+
+    def _on_input_key(self, _e=None):
+        self._render_input()
+        return None
+
+    def _focus_input(self, _e=None):
+        try:
+            # 用户已经点了输入区，这里可以抢焦点；启动时仍然不抢系统焦点
+            self.entry.focus_force()
+            self.entry.icursor("end")
+        except Exception:
+            pass
+        self._render_input()
+
+    # ---- 改名 ----
+
+    def _edit_title(self, _event=None):
+        """双击标题：就地变输入框（PR #15 底稿没有改名，补上）。"""
+        if getattr(self, "_editing", False):
+            return "break"
+        self._editing = True
+        if self._title_entry is None:
+            self._title_entry = tk.Entry(self.root, font=f(15), relief="flat", bd=0,
+                                         bg="#1b2330", fg="#f7fbff", insertbackground="#f7fbff")
+            self._title_entry.bind("<Return>", self._commit_title)
+            self._title_entry.bind("<Escape>", self._cancel_title)
+            self._title_entry.bind("<FocusOut>", self._commit_title)
+        self._title_entry.delete(0, "end")
+        self._title_entry.insert(0, self.name)
+        if self._title_item is not None:
+            self.canvas.delete(self._title_item)
+        self._title_item = self.canvas.create_window(68, 38, anchor="w",
+                                                     window=self._title_entry, width=180)
+        self._title_entry.focus_set()
+        self._title_entry.select_range(0, "end")
+        return "break"
+
+    def _commit_title(self, _event=None):
+        if not getattr(self, "_editing", False):
+            return
+        self._editing = False
+        text = self._title_entry.get().strip()
+        if self._title_item is not None:
+            self.canvas.delete(self._title_item)
+            self._title_item = None
+        if text and text != self.name:
+            self.name = text[:24]
+            self.root.title(self.name)
+            write_config({"name": self.name})
+            try:
+                if self._protocol is not None:
+                    self._protocol.action("rename", value=self.name)
+            except Exception:
+                pass
+        self._refresh_feed()
+        return "break"
+
+    def _cancel_title(self):
+        self._editing = False
+        if self._title_item is not None:
+            self.canvas.delete(self._title_item)
+            self._title_item = None
+        self._refresh_feed()
+        return "break"
+
+    # ---- 折叠 ----
+
+    def toggle_collapse(self, _event=None):
+        global H
+        # 先读真实坐标再切高度：_x/_y 只是启动时的缓存，拖动/缩放后已过期。
+        self._sync_pos()
+        self._collapsed = not getattr(self, "_collapsed", False)
+        if self._collapsed:
+            self._saved_h = H
+            H = 2 * 12 + 54
+            self._collapsed_frame = self._make_collapsed_frame()
+            # 折叠态只需要标题栏：不重建整窗几何，直接缩窗口 + 只画头。
+            # 这样不会在小高度下生成负尺寸的输入框/主体玻璃。
+            self.root.geometry(f"{W}x{H}+{self._x}+{self._y}")
+            self._build_ui()
+        else:
+            H = getattr(self, "_saved_h", H)
+            self._collapsed_frame = None
+            rebuild_geometry(W, H)
+            self.root.geometry(f"{W}x{H}+{self._x}+{self._y}")
+            self._rebuild(W, H)
+        try:
+            if self._protocol is not None:
+                self._protocol.action("collapse" if self._collapsed else "expand")
+        except Exception:
+            pass
+
+    def _message_shapes(self, shown):
+        """把四个固定大框换成按正文文字测量的聊天气泡。
+
+        时间戳不再算进气泡：它贴在气泡上方，气泡只包正文。先按最大
+        可用宽度折行，再取实际最长行的宽度；短消息不会撑满整行。
+        """
+        w, h = W, H
+        base = shapes_for(w, h)
+        left, right = base[0][0], base[0][2]
+        max_bubble = min(right - left, max(240, int((right - left) * 0.72)))
+        min_bubble = min(110, max_bubble)
+        pad = 14
+        body_font = f(11)
+        stamp_font = f(9)
+        fbody = tkfont.Font(root=self.root, font=body_font)
+        fstamp = tkfont.Font(root=self.root, font=stamp_font)
+        ls = max(1, fbody.metrics("linespace"))
+        shapes, infos = [], []
+        for i in range(4):
+            if i >= len(shown):
+                # 没有第 5 条消息时留空，不要把固定大框继续画出来。
+                shapes.append((0, 0, 0, 0, 0))
+                continue
+            msg = shown[i]
+            x0, y0, x1, y1, _r = base[i]
+            slot_h = y1 - y0
+            is_user = str(msg.get("role") or "").lower() in ("user", "me", "human")
+            stamp = str(msg.get("stamp") or "")
+            stamp_h = fstamp.metrics("linespace") if stamp else 0
+            body_avail = max(12, slot_h - stamp_h)
+            content_max = max(80, max_bubble - 2 * pad)
+            lines = self._fit_lines(msg.get("text") or "", body_font,
+                                    content_max, body_avail)
+            inner = max([0] + [fbody.measure(line) for line in lines])
+            bw = min(max_bubble, max(min_bubble, inner + 2 * pad))
+            bh = min(body_avail, max(ls + 4, len(lines) * ls + 4))
+            by0 = y0 + stamp_h
+            by1 = min(y1, by0 + bh)
+            if is_user:
+                bx1 = right
+                bx0 = bx1 - bw
+                tx, ta = bx1 - pad, "ne"
+            else:
+                bx0 = left
+                bx1 = bx0 + bw
+                tx, ta = bx0 + pad, "nw"
+            shape = (bx0, by0, bx1, by1, min(26, max(16, bh // 3)))
+            shapes.append(shape)
+            infos.append({
+                "shape": shape, "is_user": is_user, "stamp": stamp,
+                "tx": tx, "ta": ta, "lines": lines,
+                "body_font": body_font, "ty": by0 + 2,
+                "stamp_y": y0, "ls": ls,
+            })
+        shapes.extend(base[4:])
+        return shapes, infos
+
+    def _build_ui(self):
+        c = self.canvas
+        old_text, old_focus, old_cursor = "", False, 0
+        try:
+            if getattr(self, "entry", None) is not None:
+                old_text = self.entry.get()
+                old_cursor = self.entry.index("insert")
+                old_focus = self.root.focus_get() is self.entry
+                self.entry.destroy()
+        except Exception:
+            pass
+        self.entry = None
+        # 重排时必须先清掉上一轮的文字和底图：只 create 不 delete 会在每一条
+        # 新消息到达时把旧文字留在 Canvas 上，形成重影（而且旧的左对齐用户消息
+        # 会和新的右对齐版本叠在一起，看起来像“左右没分开”）。
+        c.delete("all")
+        # 背景图 item 先建，后续文字都在它上面
+        self._bg = c.create_image(0, 0, anchor="nw")
+        frame = self._collapsed_frame if getattr(self, "_collapsed", False) else self._last_frame
+        if frame is not None:
+            try:
+                self._img = ImageTk.PhotoImage(frame, master=self.canvas)
+                c.itemconfigure(self._bg, image=self._img)
+            except Exception:
+                pass
+        if PREVIEW:
+            c.create_rectangle(0, 0, W, H, fill="#0d131d", outline="",
+                               tags=("preview-bg",))
+            c.tag_lower("preview-bg")
+
+        w, h = W, H
+        # 状态点：仓库实现里的"亮着的蓝点 + 很淡的光环"。纯色圆点像贴纸，
+        # 带一圈环才像状态灯；录音时变红。
+        dot = "#e05a5a" if (self._mic_proc is not None and self._mic_proc.poll() is None) else "#0a84ff"
+        # 标题栏玻璃是 y=12..66，中心 39；右边 ▾/✕ 也在 38。点、名字、
+        # 状态必须同一条水平中线，且字号要能完整落在条内，不能压到气泡区。
+        cy = 38
+        dot_x = 54
+        title_x = 68
+        # 点放大但保留光环；之前半径 3/7 在 54px 的标题条里太小。
+        c.create_oval(dot_x - 9, cy - 9, dot_x + 9, cy + 9,
+                      outline="#2b4d73" if dot == "#0a84ff" else "#6b3030", width=1)
+        c.create_oval(dot_x - 4, cy - 4, dot_x + 4, cy + 4, fill=dot, outline="")
+        name = self.name[:10]
+        title_font = f(16, True)
+        self._text(title_x, cy, name, anchor="w", fill="#f7fbff",
+                   font=title_font, tags=("title",))
+        count = self._status or f"{len(self.messages)} 条"
+        try:
+            nx = title_x + tkfont.Font(root=self.root, font=title_font).measure(name) + 10
+        except Exception:
+            nx = title_x + 72
+        self._text(nx, cy, count, anchor="w",
+                   fill="#ffb4b4" if self._status else "#dbe6f5",
+                   font=f(11))
+        # 右上角按钮跟随窗口宽度内收
+        self._text(w - 94, 38, "▾", anchor="w",
+                   fill="#7f8da3", font=f(12), tags=("collapse",))
+        self._text(w - 58, 38, "✕", anchor="w", fill="#9fb0c8",
+                   font=f(13), tags=("close",))
+
+        if getattr(self, "_collapsed", False):
+            self.canvas.config(width=w, height=h)
+            c.tag_bind("close", "<Button-1>", self._close)
+            c.tag_bind("collapse", "<Button-1>", self.toggle_collapse)
+            # 双击改名：单击要留给"按住标题拖动窗口"，两者不能抢同一个事件
+            c.tag_bind("title", "<Double-Button-1>", self._edit_title)
+            self._bar_len = max(72, int(w * BAR_FRAC))
+            self._bar = c.create_line(w // 2 - self._bar_len // 2, BAR_Y,
+                                      w // 2 + self._bar_len // 2, BAR_Y,
+                                      width=BAR_THICK, fill="#b8cbe0",
+                                      capstyle="round")
+            return
+
+        shown = self._visible_messages()
+        if shown:
+            shapes, infos = self._message_shapes(shown)
+        else:
+            shapes, infos = shapes_for(w, h), []
+        if shapes != SHAPES:
+            with self._geo_lock:
+                apply_shapes(shapes)
+        # 每条消息只按正文占一块；时间戳贴在气泡上方，不进框。
+        for info in infos:
+            bx0, by0, bx1, by1, _r = info["shape"]
+            if info["stamp"]:
+                self._text(info["tx"], info["stamp_y"], info["stamp"],
+                           anchor=info["ta"], fill="#a8b7c9",
+                           font=f(9), tags=("feed",))
+            for li, line in enumerate(info["lines"]):
+                self._text(info["tx"], info["ty"] + li * info["ls"], line,
+                           anchor=info["ta"], fill="#edf6ff",
+                           font=info["body_font"], tags=("feed",))
+        if not shown:
+            # 空态：`bh` 是旧代码的局部变量，这里只能从 SHAPES 反推第一格高度
+            self._text(w // 2, SHAPES[0][1] + (SHAPES[0][3] - SHAPES[0][1]) // 2,
+                       "在这里跟它说话 · 滚轮翻历史", anchor="center",
+                       fill="#8e9db2", font=f(12), tags=("feed",))
+
+        # 输入：Entry 只做 IME/键盘的背面接收器，放到 2x2 且底色是键色，
+        # 真正显示的文字画在 Canvas 上 —— 否则玻璃里会出现一个突兀的黑条。
+        x0, y0, x1, y1, _r = SHAPES[4]
+        self.entry = tk.Entry(self.root, bg=KEY, fg=KEY, insertbackground=KEY,
+                              relief="flat", bd=0, font=f(11), insertwidth=0,
+                              highlightthickness=0)
+        self._entry_item = c.create_window(
+            x0 + 84, y0 + 27, window=self.entry, anchor="w",
+            width=2, height=2, tags=("feed",))
+        self.entry.bind("<KeyRelease>", self._on_input_key)
+        self.entry.bind("<Return>", self._send)
+        self.entry.bind("<FocusIn>", lambda _e: self._render_input())
+        self.entry.bind("<FocusOut>", lambda _e: self._render_input())
+        if old_text:
+            self.entry.insert(0, old_text)
+            self.entry.icursor(min(old_cursor, len(old_text)))
+        if old_focus:
+            self.entry.focus_set()
+        self._render_input()
+
+        x0, y0, x1, y1, _r = SHAPES[5]
+        self._text((x0 + x1) // 2, y0 + 27, "发送", tags=("send", "feed"),
+                   fill="#ffffff", font=f(12, True))
+
+        # 麦克风图标和仓库一样贴进玻璃帧（_capture 里按 MIC_POS 合成），
+        # 不在 Canvas 上单独建图；点击仍由 _press 在 MIC_POS 附近识别。
+        # 最上面正中的细条，长度随窗口宽度走
+        self._bar_len = max(72, int(w * BAR_FRAC))
+        self._bar = c.create_line(w // 2 - self._bar_len // 2, BAR_Y,
+                                  w // 2 + self._bar_len // 2, BAR_Y,
+                                  width=BAR_THICK, fill="#b8cbe0",
+                                  capstyle="round")
+        # 新建的条是浅色，缓存也要跟着归位；否则折叠重建后旧色值还在，
+        # `bar_fill == cur` 会把这次同步直接跳过去，条和缓存就对不上了。
+        self._bar_color = "#b8cbe0"
+
+        c.tag_bind("close", "<Button-1>", self._close)
+        c.tag_bind("send", "<Button-1>", self._send)
+        c.tag_bind("collapse", "<Button-1>", self.toggle_collapse)
+        # 同上：单击留给拖动，改名走双击
+        c.tag_bind("title", "<Double-Button-1>", self._edit_title)
+        c.tag_bind("inputzone", "<Button-1>", self._focus_input)
+        c.tag_raise("close")
+        c.tag_raise("send")
+        self._draw_scrollbar()
+        if getattr(self, "_collapsed", False):
+            c.itemconfigure("feed", state="hidden")
+
+    def _draw_scrollbar(self):
+        """仓库布局：滚动条放在主体玻璃右侧外面，不占消息区。"""
+        c = self.canvas
+        c.delete("sbar")
+        total = len(self.messages)
+        visible = 4
+        if total <= visible:
+            return
+        _top, body, _bot = slabs_for(W, H)
+        x = W - 6
+        top = body[1] + 8
+        view_h = max(1, body[3] - body[1] - 16)
+        frac = visible / float(total)
+        thumb = max(24, int(view_h * frac))
+        max_off = max(1, total - visible)
+        t = 1.0 - max(0, min(max_off, self._msg_offset)) / float(max_off)
+        y0 = top + t * max(0, view_h - thumb)
+        c.create_line(x, y0, x, y0 + thumb, width=3, fill="#8d95a4",
+                      capstyle="round", tags=("sbar",))
+        c.tag_raise("sbar")
+
+    def _preview_resize(self, w, h):
+        """拖拽时先缩放上一帧并重排文字，松手后再重建玻璃贴图。"""
+        global W, H, SHAPES, MIC_POS
+        W, H = w, h
+        SHAPES = shapes_for(w, h)
+        MIC_POS = (53, h - 67)
+        self.canvas.config(width=w, height=h)
+        self.canvas.delete("all")
+        self._img = None
+        self._bg = None
+        self._prev_out = None
+        self._text_items = []
+        self._text_colors = {}
+        self._text_pending = {}
+        self._text_shadows = {}
+        self._build_ui()
+        self._add_text_shadows()
+        shadow_ids = {sid for ids in self._text_shadows.values() for sid in ids}
+        self._text_items = [i for i in self.canvas.find_all()
+                            if self.canvas.type(i) == "text"
+                            and i not in shadow_ids]
+        if self._last_frame is not None:
+            preview = self._last_frame.resize(
+                (w, h), Image.Resampling.BILINEAR)
+            self._img = ImageTk.PhotoImage(preview, master=self.canvas)
+            self.canvas.itemconfigure(self._bg, image=self._img)
+            self.canvas.tag_lower(self._bg)
+            # 预览期间也立刻按新背景选字色，不等松手
+            self._color_at = 0.0
+            self._aux_at = 0.0
+            self._adapt_text(preview)
+            self._adapt_aux(preview)
+
+    def _rebuild(self, w, h):
+        """按新窗口尺寸重建玻璃贴图和全部 Canvas 控件。"""
+        self._pause.set()
+        with self._geo_lock:
+            rebuild_geometry(w, h)
+        self.canvas.config(width=w, height=h)
+        self.canvas.delete("all")
+        self._img = None
+        self._bg = None
+        self._prev_out = None
+        self._motion_blur = 0.0
+        self._collapsed_frame = None
+        self._text_items = []
+        self._text_colors = {}
+        self._text_pending = {}
+        self._text_shadows = {}
+        self._color_at = 0.0
+        self._aux_at = 0.0
+        self._sig = None
+        self._sig_bbox = None
+        self._build_ui()
+        self._add_text_shadows()
+        shadow_ids = {sid for ids in self._text_shadows.values() for sid in ids}
+        self._text_items = [i for i in self.canvas.find_all()
+                            if self.canvas.type(i) == "text"
+                            and i not in shadow_ids]
+        while True:
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                break
+        if self._last_frame is not None:
+            seed = self._last_frame.resize(
+                (w, h), Image.Resampling.BILINEAR)
+            self._img = ImageTk.PhotoImage(seed, master=self.canvas)
+            self.canvas.itemconfigure(self._bg, image=self._img)
+            self.canvas.tag_lower(self._bg)
+            self._color_at = 0.0
+            self._aux_at = 0.0
+            self._adapt_text(seed)
+            self._adapt_aux(seed)
+        self._pause.clear()
+
+    def _add_text_shadows(self):
+        """不再叠偏移描边；之前四向黑影会看起来像重影。"""
+        self._text_shadows = {}
+
+    def _adapt_text(self, out):
+        """按文字背后的暗部/亮部比例选色。
+
+        **必须带滞回**：气泡是透明的，背后就是桌面/视频/网页。画面一动，
+        这块背景的中位亮度就在 0.5 附近来回穿越，而原来这里是 `p50 < 0.50`
+        硬切、每 0.12 秒判一次 —— 结果字一秒能翻七八次黑白，肉眼就是"一直闪"。
+
+        现在两道闸：
+        1. **滞回**：白的要暗到 0.38 才翻深，深的要亮到 0.62 才翻白；
+           中间的 0.38~0.62 一律保持现状，不给抖动留门。
+        2. **连续两次同向才切**：单帧跳变忽略，最坏 0.24 秒才换一次色。
+        """
+        now = time.time()
+        if now - self._color_at < 0.12:
+            return
+        self._color_at = now
+        for item in self._text_items:
+            box = self.canvas.bbox(item)
+            if not box:
+                continue
+            x0, y0, x1, y1 = box
+            x0, y0 = max(0, x0 - 2), max(0, y0 - 2)
+            x1, y1 = min(W, x1 + 2), min(H, y1 + 2)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            gray = np.asarray(out.crop((x0, y0, x1, y1)).convert("L"))
+            p50 = float(np.percentile(gray, 50)) / 255.0
+            dark = float(np.mean(gray < 107))
+            light = float(np.mean(gray > 158))
+            cur = self._text_colors.get(item)
+            # 先看这块背景是偏暗还是偏亮（这两支自带 0.08 余量，本身不抖）
+            if dark > light + 0.08:
+                want = "#f2f8ff"
+            elif light > dark + 0.08:
+                want = "#07111d"
+            elif cur == "#07111d":
+                want = "#f2f8ff" if p50 < 0.38 else cur
+            else:
+                # 还没定色时先给白字；之后要亮过 0.62 才敢翻深
+                want = "#07111d" if (cur is not None and p50 > 0.62) else (cur or "#f2f8ff")
+            if want == cur:
+                self._text_pending.pop(item, None)
+                continue
+            if self._text_pending.get(item) != want:
+                self._text_pending[item] = want       # 第一次：只记下，不换
+                continue
+            self._text_pending.pop(item, None)
+            self.canvas.itemconfigure(item, fill=want)
+            self._text_colors[item] = want
+
+    def _adapt_aux(self, out):
+        """最上面细条随背景切换深浅（同样要滞回，理由见 `_adapt_text`）。"""
+        now = time.time()
+        if now - self._aux_at < 0.25:
+            return
+        self._aux_at = now
+        mid = W // 2
+        half = max(50, self._bar_len // 2)
+        bar = np.asarray(out.crop(
+            (mid - half, BAR_Y - 6, mid + half, BAR_Y + 12)).convert("L"))
+        p50 = float(np.median(bar)) / 255.0
+        cur = self._bar_color
+        if cur == "#4e6278":
+            # 已经很深了：要暗到 0.36 才翻浅，避免在阈值附近来回跳
+            bar_fill = "#b8cbe0" if p50 < 0.36 else cur
+        else:
+            bar_fill = "#4e6278" if p50 > 0.60 else cur
+        if bar_fill != cur:
+            self._bar_color = bar_fill
+            self.canvas.itemconfigure(self._bar, fill=bar_fill)
+
+
+
+    def _snapshot_mode(self):
+        """只给文档截图：停抓取、关 WDA，保留最后一帧（不改变正常路径）。"""
+        self._snapshot_done = True
+        self._pause.set()
+        if self._excluded:
+            self._set_exclude(False)
+
+    def _tick(self):
+        # 截图模式：worker 已暂停，保持 WDA 关闭；否则下一拍会重新开 WDA，
+        # 窗口再次从截图/录屏里消失，_snapshot_mode 等于没做。
+        if SNAPSHOT and getattr(self, "_snapshot_done", False):
+            self._pause.set()
+            if self._excluded:
+                self._set_exclude(False)
+            self.root.after(100, self._tick)
+            return
+        if PREVIEW:
+            self._pause.set()
+            if self._excluded:
+                self._set_exclude(False)
+            self.root.after(100, self._tick)
+            return
+        # 缩放拖拽期间由 _preview_resize 负责画面，避免旧帧覆盖预览
+        if self._resize:
+            self.root.after(INTERVAL_MS, self._tick)
+            return
+        if getattr(self, "_collapsed", False):
+            # 折叠态用 _make_collapsed_frame 的静态背景；_work 也停抓取。
+            # 若还让这里消费旧队列，会把 560px 的帧贴回 78px 的 Canvas，
+            # 底部圆角/暗边会闪一下，看起来像渲染错位。
+            self.root.after(INTERVAL_MS, self._tick)
+            return
+        if not self._excluded and os.environ.get("DSH_GLASS_WDA") != "0":
+            self._set_exclude(True)
+        self._pause.clear()
+
+        try:
+            out = self._q.get_nowait()
+        except queue.Empty:
+            out = None
+        if out is not None:
+            try:
+                self._last_frame = out
+                self._img = ImageTk.PhotoImage(out, master=self.canvas)
+                self.canvas.itemconfigure(self._bg, image=self._img)
+                self.canvas.tag_lower(self._bg)
+                self._adapt_text(out)
+                self._adapt_aux(out)
+            except Exception as exc:
+                print("draw error", exc, flush=True)
+
+        self.root.after(INTERVAL_MS, self._tick)
+
+    def _close(self, _e=None):
+        try:
+            self._save_geometry()
+            if self._chat_after is not None:
+                try:
+                    self.root.after_cancel(self._chat_after)
+                except Exception:
+                    pass
+            self._stop_mic()
+            self._stop.set()
+            self._pause.set()
+            self._set_exclude(False)
+            self._worker.join(timeout=0.3)
+            ctypes.windll.winmm.timeEndPeriod(1)
+        finally:
+            self.root.destroy()
+        return "break"
+
+    def _hide_window(self, _e=None):
+        """藏起来但继续收消息；插件写 hidden=false 后会重新出现。"""
+        write_config({"hidden": True})
+        self._hidden = True
+        self.root.withdraw()
+        return "break"
+
+    # 边缘缩放 / 窗口拖动
+    def _edge_at(self, x, y):
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        # 圆角是透明的，鼠标落在最外侧时命中的是 DWM 非客户区；
+        # 命中带放宽到 20px，用户不必精确到 1px 也能拖边缘/四角。
+        edge, corner = 20, 32
+        # 圆角区域是透明的，命中区要往内收够，才能点到可见的角
+        if x <= corner and y <= corner:
+            return "nw"
+        if x >= w - corner and y <= corner:
+            return "ne"
+        if x <= corner and y >= h - corner:
+            return "sw"
+        if x >= w - corner and y >= h - corner:
+            return "se"
+        # 顶部中间只拖动，不缩放；四角仍然可同时调宽高
+        if y <= edge:
+            return None
+        if x <= edge:
+            return "w"
+        if x >= w - edge:
+            return "e"
+        if y >= h - edge:
+            return "s"
+        return None
+
+    def _cursor_for(self, mode):
+        return {
+            "nw": "size_nw_se", "se": "size_nw_se",
+            "ne": "size_ne_sw", "sw": "size_ne_sw",
+            "w": "size_we", "e": "size_we",
+            "n": "size_ns", "s": "size_ns",
+        }.get(mode, "")
+
+    def _hover(self, e):
+        if self._resize:
+            return
+        try:
+            self.canvas.config(cursor=self._cursor_for(self._edge_at(e.x, e.y)))
+        except Exception:
+            pass
+
+    def _leave(self, _e):
+        if not self._resize:
+            self.canvas.config(cursor="")
+
+    def _press(self, e):
+        # 麦克风图标是画在玻璃里的，不在 Canvas 上单独建控件；点它不能当拖窗
+        if abs(e.x - (MIC_POS[0] + 14)) <= 22 and abs(e.y - (MIC_POS[1] + 14)) <= 22:
+            self._toggle_mic()
+            return
+        x0, y0, x1, y1, _r = SHAPES[4]
+        if x0 <= e.x <= x1 and y0 <= e.y <= y1:
+            self._focus_input()
+            return
+        mode = self._edge_at(e.x, e.y)
+        if mode:
+            self._resize = (mode, e.x_root, e.y_root,
+                            self.root.winfo_x(), self.root.winfo_y(),
+                            self.root.winfo_width(), self.root.winfo_height())
+            self._drag = None
+            self._pause.set()
+            return
+        self._drag = (e.x_root - self.root.winfo_x(),
+                      e.y_root - self.root.winfo_y())
+
+    def _motion(self, e):
+        if self._resize:
+            mode, sx, sy, x0, y0, w0, h0 = self._resize
+            dx, dy = e.x_root - sx, e.y_root - sy
+            nw, nh, nx, ny = w0, h0, x0, y0
+            if "e" in mode:
+                nw = max(MIN_W, min(max(MIN_W, self._sw - x0), w0 + dx))
+            if "w" in mode:
+                nw = max(MIN_W, min(max(MIN_W, x0 + w0), w0 - dx))
+                nx = x0 + w0 - nw
+            if "s" in mode:
+                nh = max(MIN_H, min(max(MIN_H, self._sh - y0), h0 + dy))
+            if "n" in mode:
+                nh = max(MIN_H, min(max(MIN_H, y0 + h0), h0 - dy))
+                ny = y0 + h0 - nh
+            nx = max(0, min(nx, max(0, self._sw - nw)))
+            ny = max(0, min(ny, max(0, self._sh - nh)))
+            self.root.geometry(f"{nw}x{nh}+{nx}+{ny}")
+            now = time.time()
+            if now - self._preview_at >= 0.04:
+                self._preview_at = now
+                self._preview_resize(nw, nh)
+            return
+        if self._drag:
+            # 和缩放分支一样必须钳位：拖到屏幕外时窗口坐标会变负，
+            # 抓屏区域随之越界（高度算出负数），背景永远画不出来 —— 表现为花屏。
+            nx = e.x_root - self._drag[0]
+            ny = e.y_root - self._drag[1]
+            nx = max(0, min(max(0, self._sw - self.root.winfo_width()), nx))
+            ny = max(0, min(max(0, self._sh - self.root.winfo_height()), ny))
+            self.root.geometry(f"+{nx}+{ny}")
+
+    def _release(self, e):
+        if self._resize:
+            self._resize = None
+            self._preview_at = 0.0
+            self.root.update_idletasks()
+            w = max(MIN_W, self.root.winfo_width())
+            h = max(MIN_H, self.root.winfo_height())
+            self._rebuild(w, h)
+            self._sync_pos()
+            self._hover(e)
+            return
+        self._drag = None
+        self._sync_pos()
+
+    def run(self):
+        self.root.bind("<Escape>", self._close)
+        self.root.bind("<MouseWheel>", self._wheel)
+        self.root.bind("<Motion>", self._hover, add="+")
+        self.root.bind("<Leave>", self._leave, add="+")
+        self.root.bind("<ButtonPress-1>", self._press, add="+")
+        self.root.bind("<B1-Motion>", self._motion, add="+")
+        self.root.bind("<ButtonRelease-1>", self._release, add="+")
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    LiveGlass().run()

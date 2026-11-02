@@ -1,0 +1,11 @@
+**/__pycache__/
+**/__pycache__/**
+**/*.pyc
+**/*.pyo
+scripts/__pycache__/
+.tmp/
+.venv*/
+node_modules/
+test/
+agent-transcripts/
+*.canvas.tsx

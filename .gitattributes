@@ -1,0 +1,11 @@
+# 换行统一 LF；Windows 批处理必须是 CRLF —— 否则 cmd 逐行解析会错乱
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# 截图与素材按二进制处理，别做换行转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.mp4 binary
