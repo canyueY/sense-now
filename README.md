@@ -1,22 +1,3 @@
-# Sense Now · 让 AI 实时看见你的屏幕
-
-> **AI 不再"听你描述屏幕"，而是自己看 —— 而且只传"画面变了"的那几帧。**
-> **V1.1 起还有第二条路：把视频建成可检索本地索引，按问题按需装载证据。**
-
-一个给 [DSH](https://github.com/deepseek-ai) 用的视觉插件，两条独立工作流：
-
-1. **实时陪看**（`sense_now`）—— 屏幕 / 摄像头 / 文件回放，按变化量筛帧拼图。
-2. **视频索引问答**（`video_index`）—— 一次索引、多次查询；文本优先，视觉按需。
-
-静止的屏幕几乎不花钱；一镜到底的视频按"运动量"给帧；硬切幻灯片每切一次留一帧。
-
-> **项目来源**：Sense Now 基于 SAOS-3624 的
-> [dsh-see-now](https://github.com/SAOS-3624/dsh-see-now) 开源项目继续开发，
-> 保留原项目的 Apache-2.0 `LICENSE`、`NOTICE` 与作者归属。本仓库新增字幕优先长视频索引、
-> 分块检索、按需音画证据及相关安全与预算控制。
-
----
-
 # Sense Now（见闻）
 
 [![CI](https://github.com/canyueY/sense-now/actions/workflows/ci.yml/badge.svg)](https://github.com/canyueY/sense-now/actions/workflows/ci.yml)
