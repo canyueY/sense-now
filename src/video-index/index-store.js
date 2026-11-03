@@ -240,6 +240,7 @@ export function createIndexStore({ rootDir, recoverOnCreate = true } = {}) {
     w(LAYOUT.evidence.audio, audioIndex);
     const final = validateManifest(manifest);
     w(LAYOUT.manifest, final);
+    try { unlinkSync(join(dir, '.building.json')); } catch { /* 没有构建标记 */ }
     return final;
   }
 
@@ -280,6 +281,7 @@ export function createIndexStore({ rootDir, recoverOnCreate = true } = {}) {
     if (!existsSync(join(from, LAYOUT.manifest))) {
       throw new Error('staging missing manifest; refuse publish');
     }
+    try { unlinkSync(join(from, '.building.json')); } catch { /* ignore */ }
 
     writeJournal(key, {
       phase: 'start',
@@ -511,6 +513,7 @@ export function createIndexStore({ rootDir, recoverOnCreate = true } = {}) {
   function status(videoKey) {
     const m = readManifest(videoKey, { optional: true });
     if (!m) return { ok: false, reason: 'not-found', videoKey };
+    // 残留 .building.json 不能把已 ready 的 manifest 降级
     return { ok: true, videoKey, manifest: m, status: m.status, capabilities: m.capabilities };
   }
 

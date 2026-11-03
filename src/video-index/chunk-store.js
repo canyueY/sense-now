@@ -166,11 +166,26 @@ export function createChunkStore({ rootDir, videoKey }) {
     return out.sort();
   }
 
-  function writeCatalog(entries) {
+  function writeCatalog(entries, extra = {}) {
     ensureChunksRoot();
+    const durationMs = Number.isFinite(Number(extra.durationMs))
+      ? Number(extra.durationMs)
+      : entries.reduce((m, c) => Math.max(m, Number(c.endMs) || 0), 0);
+    const covered = entries.reduce((sum, c) => {
+      const span = Math.max(0, (Number(c.endMs) || 0) - (Number(c.startMs) || 0));
+      return sum + span * (Number(c.subtitleCoverage) || 0);
+    }, 0);
+    const ratio = durationMs > 0 ? Math.min(1, covered / durationMs) : 0;
     writeJsonAtomic(join(videoDir, CHUNK_LAYOUT.catalog), {
       layoutVersion: LAYOUT_VERSION,
       updatedAt: new Date().toISOString(),
+      durationMs,
+      coverage: extra.coverage || {
+        durationMs,
+        textCoverageRatio: ratio,
+        status: ratio >= 0.7 ? 'good' : (ratio > 0 ? 'partial' : 'none'),
+        source: 'chunk_aggregate',
+      },
       chunks: entries,
     });
   }
@@ -200,7 +215,7 @@ export function createChunkStore({ rootDir, videoKey }) {
         .map((u) => Number(u.confidence))
         .filter(Number.isFinite)
         .sort((a, b) => a - b);
-      const textConfidence = confs.length ? confs[Math.floor(confs.length / 2)] : 0;
+      const textConfidence = confs.length ? confs[Math.floor(confs.length / 2)] : null;
       const gapCount = Number(c.manifest?.gapCount)
         || Math.max(0, Math.round((1 - subtitleCoverage) * 3));
       entries.push({

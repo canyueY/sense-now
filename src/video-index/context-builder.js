@@ -16,6 +16,7 @@ export function buildContext({
   zoomRequests = 0,
   audioIndex = [],
   entityOverview = [],
+  storyboardCapability = null,
 }) {
   const gate = createTokenGate({ budget });
   const visual = routeVisualNeed({
@@ -23,6 +24,7 @@ export function buildContext({
     storyboardUnits: retrieval.storyboardUnits || [],
     question,
     maxZoomRequests: gate.limits.maxZoomRequests,
+    storyboardCapability,
   });
 
   const conflicts = findConflicts(retrieval.events || []);
@@ -37,7 +39,11 @@ export function buildContext({
     chapters: retrieval.chapters || [],
     events: orderedEvents,
     utterances: retrieval.utterances || [],
-    storyboardUnits: visual.needVisual ? (visual.selected.length ? visual.selected : retrieval.storyboardUnits || []) : [],
+    storyboardUnits: visual.needVisual
+      ? (visual.selected.length
+        ? visual.selected
+        : (retrieval.storyboardUnits || []).filter((u) => u?.imageRef || (u?.evidenceIds || []).length))
+      : [],
     singleFrames: [],
     zoomRequests: visual.zoom ? visual.zoomRequests + zoomRequests : zoomRequests,
     criticalEvidenceIds: [
