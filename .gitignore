@@ -14,6 +14,13 @@ dsh-see-now/
 # 调试/标定产物（素材、截图、日志、临时脚本）
 .tmp/
 
+# 本机视频工程产物：GB 级帧序列与成片，install-dev 也会跳过
+素材图/
+视频输出/
+
+# runner 在仓库根误建的同名目录（matplotlib 字体缓存）
+sense-now/
+
 # 编辑器 / 系统
 .vscode/
 .idea/
