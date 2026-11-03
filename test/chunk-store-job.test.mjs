@@ -1,12 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createChunkStore } from '../src/video-index/chunk-store.js';
 import { createJobStore, LOCK_STALE_MS } from '../src/video-index/job-store.js';
 import { createJobController } from '../src/video-index/job-controller.js';
 import { planChunks } from '../src/video-index/chunk-plan.js';
+import { createVideoIndexEngine } from '../src/video-index/video-index-engine.js';
+import { createVideoIndexTool } from '../src/video-index-tool.js';
 
 function tmp() {
   return mkdtempSync(join(tmpdir(), 'sense-now-chunk-'));
@@ -204,6 +206,143 @@ test('同 videoKey 并发拒绝；不同 key 隔离', async () => {
 
     await ctrl.jobCancel(a.jobId);
     await ctrl.jobCancel(c.jobId);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function waitJob(engine, jobId, timeoutMs = 20_000) {
+  const t0 = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      const st = engine.jobStatus(jobId);
+      const state = st?.job?.state;
+      if (['ready', 'degraded', 'failed', 'cancelled'].includes(state)) {
+        resolve(st);
+        return;
+      }
+      if (Date.now() - t0 > timeoutMs) reject(new Error(`timeout ${state}`));
+      else setTimeout(tick, 40);
+    };
+    tick();
+  });
+}
+
+test('chunk storyboard 落盘 PNG 且带 imageRef', async () => {
+  const root = tmp();
+  const media = join(root, 'clip.mp4');
+  writeFileSync(media, Buffer.from('fake'));
+  const frame = Buffer.alloc(320 * 180 * 3, 12);
+  try {
+    const engine = createVideoIndexEngine({
+      rootDir: root,
+      adapters: {
+        fileSource: {
+          resolve: async () => ({
+            videoKey: 'file:sbtest:clip.mp4',
+            metadata: { durationMs: 15 * 60_000, path: media, title: 'clip.mp4' },
+            mediaRef: { path: media },
+            subtitles: [],
+          }),
+        },
+        probeDuration: async () => 15 * 60_000,
+        extractFrames: async () => [{ buf: frame, timestampMs: 1000, t: 1, width: 320, height: 180 }],
+        extractAudio: async () => { throw new Error('no audio'); },
+      },
+    });
+    const started = await engine.indexAdaptive({
+      source: { kind: 'file', path: media },
+      execution: 'background',
+    });
+    assert.equal(started.background, true);
+    await waitJob(engine, started.jobId);
+    const store = createChunkStore({ rootDir: root, videoKey: started.videoKey });
+    const chunk = store.readChunk('000000');
+    assert.ok(chunk.storyboard.length >= 1);
+    for (const u of chunk.storyboard) {
+      assert.ok(u.imageRef);
+      assert.ok(u.evidenceIds?.length);
+      const png = join(store.videoDir, 'evidence', 'frames', `${u.frameId}.png`);
+      assert.equal(existsSync(png), true);
+      assert.ok(readFileSync(png).length > 0);
+    }
+    assert.equal(chunk.manifest.capabilities.storyboard, 'ready');
+    const tool = createVideoIndexTool({
+      rootDir: root,
+      engine,
+      ctx: {
+        attachments: {
+          saveImage(img) { return { ok: true, bytes: img.data?.length || 0 }; },
+        },
+      },
+    });
+    const q = await tool.execute({
+      action: 'query',
+      videoKey: started.videoKey,
+      question: '画面里是什么',
+      mode: 'visual',
+    });
+    assert.ok((q.meta.visualEvidence || []).length >= 1);
+    assert.ok((q.images || []).length >= 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('抽帧失败时 storyboard 为 degraded 且不留半截 PNG', async () => {
+  const root = tmp();
+  const media = join(root, 'clip.mp4');
+  writeFileSync(media, Buffer.from('fake'));
+  try {
+    const engine = createVideoIndexEngine({
+      rootDir: root,
+      adapters: {
+        extractFrames: async () => { throw new Error('ffmpeg missing'); },
+        extractAudio: async () => null,
+      },
+    });
+    const out = await engine.indexChunk({
+      videoKey: 'file:sbfail:clip.mp4',
+      chunk: { chunkId: '000000', startMs: 0, endMs: 5000, inputStartMs: 0, inputEndMs: 5000 },
+      sourceMode: 'file',
+      mediaPath: media,
+      sourceDescriptor: { mediaPath: media },
+    });
+    assert.equal(out.capabilities.storyboard, 'degraded');
+    const framesDir = join(engine.store.videoDir('file:sbfail:clip.mp4'), 'evidence', 'frames');
+    if (existsSync(framesDir)) {
+      assert.equal(readdirSync(framesDir).length, 0);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('旧 chunk 无图时视觉查询标记 storyboard_missing_images', async () => {
+  const root = tmp();
+  try {
+    const videoKey = 'file:oldsb:clip.mp4';
+    const store = createChunkStore({ rootDir: root, videoKey });
+    store.commitChunk('000000', {
+      chunkManifest: {
+        chunkId: '000000', revision: 1, startMs: 0, endMs: 300_000, status: 'ready', sourceMode: 'file',
+      },
+      utterances: [],
+      events: [],
+      speakers: [],
+      storyboard: [{ frameId: 'FRAME_old', timestampMs: 1000, chunkId: '000000' }],
+      evidence: [],
+      chapters: [],
+    });
+    store.rebuildCatalog();
+    const engine = createVideoIndexEngine({ rootDir: root, adapters: {} });
+    const q = engine.query({ videoKey, question: '画面里是什么', mode: 'visual' });
+    assert.equal(q.visualEvidence?.length || 0, 0);
+    assert.ok((q.reasons || []).includes('storyboard_missing_images'));
+    const tool = createVideoIndexTool({ rootDir: root, engine });
+    const out = await tool.execute({ action: 'query', videoKey, question: '画面', mode: 'visual' });
+    assert.equal(out.meta.visualEvidence?.length || 0, 0);
+    assert.ok(out.meta.reasons.includes('storyboard_missing_images'));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -296,8 +296,8 @@ export function selectChunksFromCatalog(catalog, {
     });
   }
 
-  const scored = entries
-    .filter((c) => ['ready', 'degraded'].includes(c.status))
+  const readyEntries = entries.filter((c) => ['ready', 'degraded'].includes(c.status));
+  const scored = readyEntries
     .map((c) => {
       let score = 0;
       if (atMs != null && c.startMs <= atMs && atMs < c.endMs) score += 20;
@@ -308,6 +308,19 @@ export function selectChunksFromCatalog(catalog, {
     })
     .filter((c) => c.score > 0 || (atMs == null && queryType === 'text_structure'))
     .sort((a, b) => b.score - a.score || a.chunkId.localeCompare(b.chunkId));
+
+  // 画面问题常常没有文本命中；仍要加载带帧的 chunk，否则 storyboard 永远进不了 query
+  if (!scored.length && (queryType === 'visual' || queryType === 'multimodal' || queryType === 'deep')) {
+    const fallback = readyEntries.slice(0, Math.max(1, topK));
+    return {
+      chunkIds: fallback.map((c) => c.chunkId),
+      scores: fallback.map((c) => ({
+        chunkId: c.chunkId, score: 0.1, startMs: c.startMs, endMs: c.endMs,
+      })),
+      atMs,
+      mode: 'visual_fallback',
+    };
+  }
 
   let picks = scored;
   if (atMs != null) {

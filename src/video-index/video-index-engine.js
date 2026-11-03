@@ -525,32 +525,81 @@ export function createVideoIndexEngine({
             capabilities.storyboard = 'ready';
           } else if (mediaPath && existsSync(mediaPath)) {
             const seekSec = (chunk.startMs + chunk.endMs) / 2000;
+            const fw = 320;
+            const fh = 180;
             const frames = await extractFrames({
               path: mediaPath,
               ffmpegPath,
-              width: 320,
-              height: 180,
+              width: fw,
+              height: fh,
               fps: 1,
               signal,
               maxFrames,
               seekSec,
             });
+            let stored = 0;
             for (const fr of frames.slice(0, maxFrames)) {
-              // extractFrames 返回绝对媒体时间 timestampMs；禁止再叠加 chunk.startMs
+              if (!fr?.buf) continue;
               const ts = Number.isFinite(fr.timestampMs)
                 ? Math.round(fr.timestampMs)
                 : Math.round((Number(fr.t) || 0) * 1000);
-              storyboard.push({
-                frameId: frameIdOf({
-                  videoKey,
-                  timestampMs: ts,
-                  contentHash: contentHash(`${chunk.chunkId}:${ts}`),
-                }),
+              let w = fr.width || fw;
+              let h = fr.height || fh;
+              let png;
+              try {
+                if (fr.buf.length !== w * h * 3) {
+                  w = 1;
+                  h = 1;
+                  const px = Buffer.alloc(3);
+                  fr.buf.copy(px, 0, 0, Math.min(3, fr.buf.length));
+                  png = encodePng(px, 1, 1, { level: 3 });
+                } else {
+                  png = encodePng(fr.buf, w, h, { level: 3 });
+                }
+              } catch {
+                continue;
+              }
+              const ch = contentHash(png);
+              const roi = { x: 0, y: 0, width: w, height: h };
+              const fid = frameIdOf({ videoKey, timestampMs: ts, roi, contentHash: ch });
+              const eid = evidenceIdOf({
+                videoKey, kind: 'frame', startMs: ts, endMs: ts, contentHash: ch,
+              });
+              const sourceFile = `evidence/frames/${fid}.png`;
+              try {
+                store.writeBinary(videoKey, sourceFile, png);
+              } catch {
+                continue;
+              }
+              const unit = {
+                frameId: fid,
                 timestampMs: ts,
                 chunkId: chunk.chunkId,
+                imageRef: evidenceLogicalRef(videoKey, 'frame', fid),
+                sourceSize: { width: w, height: h },
+                storedSize: { width: w, height: h },
+                roi,
+                transform: { scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0 },
+                selectionReasons: ['chunk_lightweight'],
+                evidenceIds: [eid],
+              };
+              storyboard.push(unit);
+              evidence.push({
+                evidenceId: eid,
+                kind: 'frame',
+                startMs: ts,
+                endMs: ts,
+                ref: unit.imageRef,
+                sourceFile,
+                contentHash: ch,
+                provenance: { via: 'chunk_storyboard', generatedAt: clock() },
               });
+              stored += 1;
             }
-            capabilities.storyboard = storyboard.length ? 'ready' : 'degraded';
+            const complete = storyboard.length > 0
+              && storyboard.every((u) => u.imageRef && u.evidenceIds?.length)
+              && stored === storyboard.length;
+            capabilities.storyboard = complete ? 'ready' : 'degraded';
           } else {
             capabilities.storyboard = 'unavailable';
           }
@@ -1694,6 +1743,10 @@ export function createVideoIndexEngine({
       if (cached.hit) {
         return { ...cached.value, cache: { hit: true, key }, chunksLoaded: selected.chunkIds };
       }
+      const chunkStoryboardCap = loaded.length
+        && loaded.every((c) => c.manifest?.capabilities?.storyboard === 'skipped')
+        ? 'skipped'
+        : null;
       const built = buildContext({
         retrieval,
         queryType: routed.queryType,
@@ -1701,6 +1754,7 @@ export function createVideoIndexEngine({
         budget: limits,
         audioIndex: (merged.speakers || []).map((s) => ({ kind: 'speaker', ...s })),
         entityOverview: [],
+        storyboardCapability: chunkStoryboardCap,
       });
       // citation 补 chunkId/revision/timeSource
       const citations = (built.citations || []).map((c) => {
@@ -1798,6 +1852,7 @@ export function createVideoIndexEngine({
       budget: limits,
       audioIndex: indexData.audioIndex || [],
       entityOverview: indexData.entityOverview || [],
+      storyboardCapability: indexData.manifest?.capabilities?.storyboard || null,
     });
 
     let result = {
