@@ -2405,6 +2405,8 @@ export function createVideoIndexEngine({
         execution: needBg || exec === 'background' ? 'background' : 'sync',
         speakerMerge: mergeOpts || capabilities?.speakerMerge || null,
         analysisPolicy: policyArg,
+        // 不传下去的话 chunk 路径会复用 ready chunk，rebuild 变成静默 no-op
+        rebuild: indexOptions.rebuild === true,
       });
       return sanitizePublicJobResult({
         ...r,
