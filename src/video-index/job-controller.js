@@ -12,6 +12,9 @@ import {
   writePrivateEmbeddings, writeSpeakerMap,
 } from './speaker-merge.js';
 import { killProcessTree } from './bounded-stdio.js';
+import {
+  sanitizeSourceRef, writeSourceRef, readSourceRef, descriptorFromSourceRef,
+} from './source-ref.js';
 
 const SYNC_SAFE_MS = 12 * 60_000;
 const TERMINAL_CANCELLED = 'cancelled';
@@ -104,6 +107,20 @@ export function createJobController({
       return { ok: false, reason: 'locked', detail: lock.detail, lock: lock.lock };
     }
 
+    const safeRef = sanitizeSourceRef({
+      sourceMode,
+      durationMs,
+      sourceDescriptor,
+      subtitlePath: sourceDescriptor?.subtitlePath || null,
+      analysisPolicy,
+    });
+    const chunkStore = createChunkStore({ rootDir, videoKey });
+    try {
+      writeSourceRef(chunkStore.videoDir, safeRef, { clock: () => new Date(clock()).toISOString() });
+    } catch (e) {
+      log(`source-ref write failed: ${e.message}`);
+    }
+
     const job = jobs.createJob({
       videoKey,
       sourceMode,
@@ -129,6 +146,13 @@ export function createJobController({
         currentStage: 'planning',
       },
       hasDescriptor: Boolean(sourceDescriptor),
+      hasSubtitlePath: Boolean(safeRef.subtitlePath),
+      safeSource: {
+        mediaPath: safeRef.mediaPath,
+        subtitlePath: safeRef.subtitlePath,
+        durationMs: safeRef.durationMs,
+        sourceMode: safeRef.sourceMode,
+      },
       speakerMerge: mergeOpts || speakerMerge || null,
     });
 
@@ -563,13 +587,19 @@ export function createJobController({
     }));
     const attempt = nextAttempt;
     const nonce = lock.lock?.nonce || null;
+    // resume：从落盘 source-ref / job.safeSource 恢复媒体与外挂字幕路径（不含远程签名流）
+    const storeForResume = createChunkStore({ rootDir, videoKey: job.videoKey });
+    const diskRef = readSourceRef(storeForResume.videoDir, { optional: true })
+      || job.safeSource
+      || null;
+    const resumedDescriptor = descriptorFromSourceRef(diskRef);
     setImmediate(() => {
       runIndexingJob({
         jobId,
         videoKey: job.videoKey,
         plan,
-        sourceMode: job.sourceMode,
-        sourceDescriptor: null,
+        sourceMode: job.sourceMode || diskRef?.sourceMode || 'file',
+        sourceDescriptor: resumedDescriptor,
         capabilities: {},
         attempt,
         lockNonce: nonce,

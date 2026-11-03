@@ -227,12 +227,17 @@ export function createVideoIndexTool({
   });
 
   async function loadPngForUnit(videoKey, unit) {
-    const indexData = eng.store.loadIndex(videoKey);
-    const ev = (indexData.evidenceIndex || []).find((e) => (unit.evidenceIds || []).includes(e.evidenceId));
+    const view = eng.loadQueryableIndex(videoKey);
+    if (!view.ok) return null;
+    const ev = (view.index.evidenceIndex || []).find((e) => (unit.evidenceIds || []).includes(e.evidenceId));
     if (!ev?.sourceFile) return null;
-    const file = eng.store.resolveEvidenceFile(videoKey, ev.sourceFile);
-    if (!existsSync(file)) return null;
-    return readFileSync(file);
+    try {
+      const file = eng.store.resolveEvidenceFile(videoKey, ev.sourceFile);
+      if (!existsSync(file)) return null;
+      return readFileSync(file);
+    } catch {
+      return null;
+    }
   }
 
   const toolObj = {
@@ -375,24 +380,40 @@ export function createVideoIndexTool({
               meta: { ok: false, reason: 'evidenceIds_invalid', evidenceIdsSanitized: true },
             };
           }
-          const indexData = eng.store.loadIndex(videoKey);
-          let pack = buildFullEvidencePackage(indexData, {
+          const view = eng.loadQueryableIndex(videoKey, {
+            startMs: hasRange ? Number(args.startMs) : null,
+            endMs: hasRange ? Number(args.endMs) : null,
+          });
+          if (!view.ok) {
+            return {
+              text: `未找到索引 ${videoKey}（monolithic 与 chunk catalog 均无）。`,
+              meta: { ok: false, reason: 'not-found' },
+            };
+          }
+          let pack = buildFullEvidencePackage(view.index, {
             startMs: hasRange ? Number(args.startMs) : 0,
             endMs: hasRange ? Number(args.endMs) : Number.POSITIVE_INFINITY,
             evidenceIds: requestedIds ? rawIds : null,
             includeIdentity: args.includeIdentity === true,
           });
           pack = applyFullEvidenceBudget(pack, args.budget || {});
+          pack.layout = view.layout;
           return {
-            text: `Full evidence package for ${videoKey}（scoped${pack.budget?.truncated ? ', truncated' : ''}）。`,
+            text: `Full evidence package for ${videoKey}（${view.layout}, scoped${pack.budget?.truncated ? ', truncated' : ''}）。`,
             meta: toLosslessJson(pack),
           };
         }
         if (args.package === 'minimal') {
-          const indexData = eng.store.loadIndex(videoKey);
+          const view = eng.loadQueryableIndex(videoKey);
+          if (!view.ok) {
+            return {
+              text: `未找到索引 ${videoKey}。`,
+              meta: { ok: false, reason: 'not-found' },
+            };
+          }
           return {
-            text: `Minimal index package for ${videoKey}。`,
-            meta: toLosslessJson(buildMinimalIndexPackage(indexData)),
+            text: `Minimal index package for ${videoKey}（${view.layout}）。`,
+            meta: toLosslessJson({ ...buildMinimalIndexPackage(view.index), layout: view.layout }),
           };
         }
         if (args.mnemosyneClaim) {
@@ -600,15 +621,17 @@ export function createVideoIndexTool({
           confirmation: args.confirmation || null,
           retryPlan: args.retryPlan || null,
         });
-        if (r.reportOnly) {
+        if (r.reportOnly || r.registeredOnly) {
           return {
-            text: `二次分析未执行（${r.reason}）。planHash=${r.planHash || 'n/a'}；确认时请回传精确 planHash。`,
+            text: r.registeredOnly
+              ? `二次分析计划已登记但未真正执行写入（${r.reason}）。planHash=${r.planHash || 'n/a'}。${r.note || ''}`
+              : `二次分析未执行（${r.reason}）。planHash=${r.planHash || 'n/a'}；确认时请回传精确 planHash。`,
             meta: toLosslessJson(r),
           };
         }
         if (r.executed) {
           return {
-            text: `已按确认执行局部二次分析计划（planHash=${r.planHash}）。`,
+            text: `已按确认执行局部二次分析并写入证据（planHash=${r.planHash}）。`,
             meta: toLosslessJson(r),
           };
         }

@@ -82,6 +82,9 @@ import { decideSecondPass } from './refinement-planner.js';
 import { selectUtteranceEndFrames } from './utterance-end-frame.js';
 import { writeJsonAtomic } from './atomic-json.js';
 import { spawnSync } from 'node:child_process';
+import {
+  attachIndexOptionsToDescriptor, readSourceRef,
+} from './source-ref.js';
 
 function aborted(signal) {
   if (signal?.aborted) {
@@ -1380,7 +1383,8 @@ export function createVideoIndexEngine({
       ? store.activeVideoDir(videoKey)
       : store.videoDir(videoKey);
     const prior = loadRefinementExec(videoDir, planHash);
-    if (prior?.ok || prior?.success) {
+    // 仅当确实成功写入过才算 already_executed；registeredOnly / 仅落盘不算
+    if (prior && prior.registeredOnly !== true && (prior.success === true || (prior.ok === true && prior.executed === true))) {
       refinementDone.set(memoKey, prior);
       return {
         ok: true,
@@ -1404,8 +1408,10 @@ export function createVideoIndexEngine({
       return { ok: false, reason: 'asr_off', asrCalls: 0 };
     }
 
+    const sourceRef = readSourceRef(videoDir, { optional: true });
     const durationMs = monolithic?.metadata?.durationMs
       || catalog?.durationMs
+      || sourceRef?.durationMs
       || 0;
     const currentRev = monolithic
       ? (monolithic.manifest?.counts?.evidence || 0)
@@ -1433,6 +1439,7 @@ export function createVideoIndexEngine({
 
     const mediaPath = monolithic?.metadata?.path
       || catalog?.mediaPath
+      || sourceRef?.mediaPath
       || null;
     if (!mediaPath || !existsSync(mediaPath)) {
       return { ok: false, reason: 'unavailable', detail: 'no_media' };
@@ -1828,20 +1835,104 @@ export function createVideoIndexEngine({
     return result;
   }
 
+  /**
+   * 统一加载可查询视图：优先 monolithic，否则合并 chunk catalog。
+   * evidence / zoom / package 必须走这里，不能只查 store.exists。
+   */
+  function loadQueryableIndex(videoKey, {
+    startMs = null,
+    endMs = null,
+    chunkIds = null,
+  } = {}) {
+    if (store.exists(videoKey)) {
+      return {
+        ok: true,
+        layout: 'monolithic',
+        index: store.loadIndex(videoKey),
+        chunkStore: null,
+        sourceRef: readSourceRef(store.videoDir(videoKey), { optional: true }),
+      };
+    }
+    const chunkStore = createChunkStore({ rootDir, videoKey });
+    const catalog = chunkStore.readCatalog({ optional: true });
+    if (!catalog?.chunks?.length) {
+      return { ok: false, reason: 'not-found', layout: null, index: null };
+    }
+    let ids = Array.isArray(chunkIds) && chunkIds.length
+      ? chunkIds
+      : catalog.chunks.map((c) => c.chunkId);
+    if (startMs != null || endMs != null) {
+      const a = startMs == null ? -Infinity : Number(startMs);
+      const b = endMs == null ? Infinity : Number(endMs);
+      ids = catalog.chunks
+        .filter((c) => Number(c.endMs) > a && Number(c.startMs) < b)
+        .map((c) => c.chunkId);
+      if (!ids.length) ids = catalog.chunks.map((c) => c.chunkId);
+    }
+    const loaded = [];
+    for (const id of ids) {
+      const c = chunkStore.readChunk(id, { optional: true });
+      if (c) loaded.push(c);
+    }
+    if (!loaded.length) {
+      return { ok: false, reason: 'not-found', layout: 'chunk_catalog', index: null };
+    }
+    const merged = mergeChunkViews(loaded);
+    const sourceRef = readSourceRef(chunkStore.videoDir, { optional: true });
+    const durationMs = sourceRef?.durationMs
+      || Math.max(...catalog.chunks.map((c) => Number(c.endMs) || 0), 0);
+    return {
+      ok: true,
+      layout: 'chunk_catalog',
+      index: {
+        ...merged,
+        metadata: {
+          ...(merged.metadata || {}),
+          path: sourceRef?.mediaPath || null,
+          durationMs,
+        },
+        manifest: {
+          status: 'ready',
+          layoutVersion: catalog.layoutVersion || LAYOUT_VERSION,
+          indexVersion: catalog.layoutVersion || LAYOUT_VERSION,
+          updatedAt: catalog.updatedAt || null,
+          counts: {
+            chunks: catalog.chunks.length,
+            evidence: (merged.evidenceIndex || []).length,
+            utterances: (merged.utterances || []).length,
+          },
+        },
+        effectivePolicy: null,
+        coverage: null,
+      },
+      chunkStore,
+      catalog,
+      loadedChunks: loaded,
+      sourceRef,
+    };
+  }
+
   function getEvidence(request = {}) {
     const { videoKey, evidenceIds = [], startMs, endMs } = request;
-    if (!store.exists(videoKey)) return { ok: false, reason: 'not-found', evidence: [] };
-    const indexData = store.loadIndex(videoKey);
+    const view = loadQueryableIndex(videoKey, { startMs, endMs });
+    if (!view.ok) return { ok: false, reason: 'not-found', evidence: [], layout: null };
     const idSet = evidenceIds.length ? new Set(evidenceIds) : null;
-    let list = indexData.evidenceIndex || [];
+    let list = view.index.evidenceIndex || [];
     if (idSet) list = list.filter((e) => idSet.has(e.evidenceId));
     if (startMs != null) list = list.filter((e) => e.endMs >= startMs);
     if (endMs != null) list = list.filter((e) => e.startMs <= endMs);
-    // 路径安全：只返回索引内引用
+    // 路径安全：只返回索引内引用（chunk 与 monolithic 共用 videoDir）
     for (const e of list) {
-      if (e.sourceFile) store.resolveEvidenceFile(videoKey, e.sourceFile);
+      if (e.sourceFile) {
+        try { store.resolveEvidenceFile(videoKey, e.sourceFile); } catch { /* skip unsafe */ }
+      }
     }
-    return { ok: true, videoKey, evidence: list };
+    return {
+      ok: true,
+      videoKey,
+      evidence: list,
+      layout: view.layout,
+    };
   }
 
   async function zoom(request = {}) {
@@ -1850,8 +1941,9 @@ export function createVideoIndexEngine({
     } = request;
     aborted(signal);
     const limits = mergeBudget(budget);
-    if (!store.exists(videoKey)) return { ok: false, reason: 'not-found' };
-    const indexData = store.loadIndex(videoKey);
+    const view = loadQueryableIndex(videoKey, { startMs, endMs });
+    if (!view.ok) return { ok: false, reason: 'not-found' };
+    const indexData = view.index;
     // 先检查已有 storyboard
     const existing = (indexData.storyboardIndex || []).filter((s) => {
       const t = s.timestampMs;
@@ -1864,6 +1956,7 @@ export function createVideoIndexEngine({
         reused: true,
         units: existing.slice(0, limits.maxStoryboardUnits),
         zoomRequests: 0,
+        layout: view.layout,
       };
     }
     // 受 maxZoomRequests 限制；此处单次 zoom = 1
@@ -1871,7 +1964,7 @@ export function createVideoIndexEngine({
       return { ok: false, reason: 'zoom_budget_exhausted', zoomRequests: 0 };
     }
     const meta = indexData.metadata || {};
-    const path = meta.path;
+    const path = meta.path || view.sourceRef?.mediaPath || null;
     if (!path) {
       return { ok: false, reason: 'no_media', detail: 'cannot zoom without local media path' };
     }
@@ -1915,10 +2008,9 @@ export function createVideoIndexEngine({
       transform: { scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0 },
       selectionReasons: ['manual_request', 'zoom'],
       evidenceIds: [eid],
+      chunkId: null,
     };
-    // 追加到索引（更新 storyboard + evidence，bump updatedAt，保留 indexVersion 内容哈希不变除非内容变——zoom 会改 evidence，需更新）
-    const storyboardIndex = [...(indexData.storyboardIndex || []), unit];
-    const evidenceIndex = [...(indexData.evidenceIndex || []), {
+    const frameEvidence = {
       evidenceId: eid,
       kind: 'frame',
       startMs: timestampMs,
@@ -1927,7 +2019,52 @@ export function createVideoIndexEngine({
       sourceFile,
       contentHash: ch,
       provenance: { adapter: 'zoom', version: '1', generatedAt: clock() },
-    }];
+    };
+
+    // chunk catalog：写入时间中点所属 chunk，递增 revision，重建 catalog
+    if (view.layout === 'chunk_catalog' && view.chunkStore) {
+      const mid = timestampMs;
+      const owner = (view.catalog?.chunks || []).find(
+        (c) => mid >= Number(c.startMs) && mid < Number(c.endMs),
+      ) || (view.catalog?.chunks || [])[0];
+      if (!owner) {
+        return { ok: false, reason: 'no_chunk', detail: 'catalog empty' };
+      }
+      const existingChunk = view.chunkStore.readChunk(owner.chunkId, { optional: true });
+      if (!existingChunk) {
+        return { ok: false, reason: 'chunk_missing', chunkId: owner.chunkId };
+      }
+      unit.chunkId = owner.chunkId;
+      frameEvidence.chunkId = owner.chunkId;
+      const rev = (existingChunk.manifest?.revision || 1) + 1;
+      view.chunkStore.commitChunk(owner.chunkId, {
+        chunkManifest: {
+          ...existingChunk.manifest,
+          revision: rev,
+          status: existingChunk.manifest?.status || 'ready',
+        },
+        utterances: existingChunk.utterances || [],
+        events: existingChunk.events || [],
+        speakers: existingChunk.speakers || [],
+        storyboard: [...(existingChunk.storyboard || []), unit],
+        evidence: [...(existingChunk.evidence || []), frameEvidence],
+        chapters: existingChunk.chapters || [],
+      });
+      try { view.chunkStore.rebuildCatalog(); } catch { /* ignore */ }
+      return {
+        ok: true,
+        zoom: true,
+        reused: false,
+        units: [unit],
+        zoomRequests: 1,
+        layout: 'chunk_catalog',
+        chunkId: owner.chunkId,
+      };
+    }
+
+    // monolithic：追加到全局索引
+    const storyboardIndex = [...(indexData.storyboardIndex || []), unit];
+    const evidenceIndex = [...(indexData.evidenceIndex || []), frameEvidence];
     const newVersion = indexVersionOf({
       prev: indexData.manifest.indexVersion,
       zoom: eid,
@@ -1958,7 +2095,9 @@ export function createVideoIndexEngine({
       storyboardIndex,
       audioIndex: indexData.audioIndex,
     });
-    return { ok: true, zoom: true, reused: false, units: [unit], zoomRequests: 1 };
+    return {
+      ok: true, zoom: true, reused: false, units: [unit], zoomRequests: 1, layout: 'monolithic',
+    };
   }
 
   function chunkCatalogOf(videoKey) {
@@ -2046,24 +2185,35 @@ export function createVideoIndexEngine({
     mediaPath = null,
     signal,
     speakerMerge: mergeOpts = null,
+    indexOptions = {},
+    analysisPolicy = undefined,
   } = {}) {
     aborted(signal);
     const prepared = await prepareSourceForIndex({
       source, durationMs, videoKey, mediaPath, signal,
     });
+    const sourceDescriptor = attachIndexOptionsToDescriptor(
+      {
+        ...(prepared.sourceDescriptor || {}),
+        durationMs: prepared.durationMs,
+      },
+      indexOptions,
+    );
     const r = await jobs.startIndexJob({
       videoKey: prepared.videoKey,
       durationMs: prepared.durationMs,
       sourceMode: prepared.sourceMode,
-      sourceDescriptor: prepared.sourceDescriptor,
+      sourceDescriptor,
       capabilities,
       execution,
       speakerMerge: mergeOpts || capabilities?.speakerMerge || null,
+      analysisPolicy,
     });
     return sanitizePublicJobResult({
       ...r,
       durationMs: prepared.durationMs,
       durationWarning: prepared.durationWarning || null,
+      hasSubtitlePath: Boolean(sourceDescriptor.subtitlePath),
     });
   }
 
@@ -2162,11 +2312,19 @@ export function createVideoIndexEngine({
 
     // URL 已持有内存 descriptor：后台或同步分块都走 startIndexJob，避免二次 resolveStreams
     if (needBg || exec === 'background' || prepared.sourceMode === 'url' || exec === 'sync') {
+      // 外挂字幕等 indexOptions 必须并入 descriptor，否则后台 chunk 拿不到 subtitlePath
+      const sourceDescriptor = attachIndexOptionsToDescriptor(
+        {
+          ...(prepared.sourceDescriptor || {}),
+          durationMs: prepared.durationMs,
+        },
+        indexOptions,
+      );
       const r = await jobs.startIndexJob({
         videoKey: prepared.videoKey,
         durationMs: prepared.durationMs,
         sourceMode: prepared.sourceMode,
-        sourceDescriptor: prepared.sourceDescriptor,
+        sourceDescriptor,
         capabilities,
         execution: needBg || exec === 'background' ? 'background' : 'sync',
         speakerMerge: mergeOpts || capabilities?.speakerMerge || null,
@@ -2177,6 +2335,7 @@ export function createVideoIndexEngine({
         adaptive: true,
         durationMs: prepared.durationMs,
         durationWarning: prepared.durationWarning,
+        hasSubtitlePath: Boolean(sourceDescriptor.subtitlePath),
       });
     }
 
@@ -2488,20 +2647,32 @@ export function createVideoIndexEngine({
   } = {}) {
     // 二次分析确认：ask/auto_once 守卫（无 URL 时也可仅确认计划）
     if (confirmation?.planHash || retryPlan) {
-      const existing = store.loadIndex(videoKey);
+      const view = loadQueryableIndex(videoKey);
+      if (!view.ok && !store.exists(videoKey)) {
+        return { ok: false, reason: 'not-found' };
+      }
+      let existing = null;
+      try {
+        if (store.exists(videoKey)) existing = store.loadIndex(videoKey);
+      } catch { existing = null; }
       const policy = normalizeAnalysisPolicy(
-        rawPolicy !== undefined ? rawPolicy : (existing.effectivePolicy || {}),
+        rawPolicy !== undefined
+          ? rawPolicy
+          : (existing?.effectivePolicy || {}),
         { explicitPolicy: true },
       );
-      const audit = existing.audit || (retryPlan ? { retryPlan, planHash: confirmation?.planHash } : null);
-      const priorPath = join(store.activeVideoDir(videoKey), 'refinements');
+      const audit = existing?.audit || (retryPlan ? { retryPlan, planHash: confirmation?.planHash } : null);
+      const priorPath = join(
+        store.exists(videoKey) ? store.activeVideoDir(videoKey) : store.videoDir(videoKey),
+        'refinements',
+      );
       let priorAutoOnceDone = false;
       try {
         if (existsSync(priorPath)) {
           for (const name of readdirSync(priorPath)) {
-            if (!name.endsWith('.json')) continue;
+            if (!name.startsWith('exec-') || !name.endsWith('.json')) continue;
             const body = JSON.parse(readFileSync(join(priorPath, name), 'utf8'));
-            if (body.autoOnceDone) priorAutoOnceDone = true;
+            if (body.autoOnceDone || body.success === true) priorAutoOnceDone = true;
           }
         }
       } catch { /* ignore */ }
@@ -2537,18 +2708,24 @@ export function createVideoIndexEngine({
         };
       }
       mkdirSync(priorPath, { recursive: true });
-      const revision = (existing.manifest?.counts?.evidence || 0) + 1;
+      const revision = (existing?.manifest?.counts?.evidence || 0) + 1;
       const windows = decision.retryPlan?.windows || [];
       let asrResult = null;
       const wantLocalAsr = policy.asr?.mode === 'on_demand'
         || policy.asr?.mode === 'fallback'
-        || (decision.retryPlan?.actionsits || []).some((e) => /asr/i.test(String(e.action || e)));
+        || (decision.retryPlan?.edits || []).some((e) => /asr/i.test(String(e.action || e)));
       // 不得暗中把 ASR 从 off 改成其他模式
       if (wantLocalAsr && policy.asr?.mode !== 'off' && mayRunAsr(policy, {
         reason: policy.asr.mode === 'fallback' ? 'subtitle_gap' : 'refine',
       }).ok) {
-        const mediaPath = existing.metadata?.path || null;
-        const tempDir = join(store.activeVideoDir(videoKey), 'tmp', 'refine-asr');
+        const mediaPath = existing?.metadata?.path
+          || view.sourceRef?.mediaPath
+          || null;
+        const tempDir = join(
+          store.exists(videoKey) ? store.activeVideoDir(videoKey) : store.videoDir(videoKey),
+          'tmp',
+          'refine-asr',
+        );
         asrResult = await runOnDemandAsrWindows({
           videoKey,
           windows: windows.length
@@ -2558,9 +2735,9 @@ export function createVideoIndexEngine({
               reason: w.reason || 'refine',
             }))
             : planAsrWindows({
-              durationMs: existing.metadata?.durationMs || 0,
+              durationMs: existing?.metadata?.durationMs || view.sourceRef?.durationMs || 0,
               policy,
-              gaps: existing.coverage?.gaps || [],
+              gaps: existing?.coverage?.gaps || [],
             }),
           mediaPath,
           asr,
@@ -2571,7 +2748,7 @@ export function createVideoIndexEngine({
           revision,
           clock,
         });
-        if (asrResult.ok) {
+        if (asrResult.ok && existing && store.exists(videoKey)) {
           const nextUtterances = [
             ...(existing.utterances || []),
             ...asrResult.utterances,
@@ -2596,19 +2773,24 @@ export function createVideoIndexEngine({
           });
         }
       }
+      const asrWrote = Boolean(asrResult?.ok && (asrResult.evidence?.length || asrResult.utterances?.length));
+      const executed = asrWrote;
       writeJsonAtomic(join(priorPath, `exec-${decision.planHash}.json`), {
         executedAt: clock(),
         planHash: decision.planHash,
         retryPlan: decision.retryPlan,
-        autoOnceDone: decision.mode === 'auto_once',
+        autoOnceDone: executed && decision.mode === 'auto_once',
         revision,
+        ok: executed,
+        success: executed,
+        registeredOnly: !executed,
         before: {
-          utterances: existing.utterances?.length || 0,
-          evidence: existing.evidenceIndex?.length || 0,
+          utterances: existing?.utterances?.length || 0,
+          evidence: existing?.evidenceIndex?.length || 0,
         },
         after: {
-          utterances: (existing.utterances?.length || 0) + (asrResult?.utterances?.length || 0),
-          evidence: (existing.evidenceIndex?.length || 0) + (asrResult?.evidence?.length || 0),
+          utterances: (existing?.utterances?.length || 0) + (asrResult?.utterances?.length || 0),
+          evidence: (existing?.evidenceIndex?.length || 0) + (asrResult?.evidence?.length || 0),
         },
         triggerReasons: decision.retryPlan?.reasons || [],
         asrCalls: asrResult?.asrCalls || 0,
@@ -2617,21 +2799,24 @@ export function createVideoIndexEngine({
       return {
         ok: true,
         refine: true,
-        executed: true,
+        executed,
+        registeredOnly: !executed,
+        reportOnly: !executed,
+        reason: executed ? 'executed' : (asrResult?.reason || 'plan_registered_no_asr_write'),
         planHash: decision.planHash,
         windows,
         revision,
         onDemandAsr: asrResult
           ? {
-            executed: Boolean(asrResult.ok),
+            executed: asrWrote,
             asrCalls: asrResult.asrCalls,
             evidenceIds: (asrResult.evidence || []).map((e) => e.evidenceId),
             reason: asrResult.reason || null,
           }
           : null,
-        note: asrResult?.ok
+        note: asrWrote
           ? '局部 ASR 已写入新 revision，原字幕 evidence 保留'
-          : '局部重试已登记',
+          : '计划已确认并登记，但未写入 ASR evidence（asr.mode=off、无媒体或运行失败）；不得视为已执行',
       };
     }
 
@@ -2704,6 +2889,7 @@ export function createVideoIndexEngine({
     executeRefinement,
     getEvidence,
     zoom,
+    loadQueryableIndex,
     status,
     list,
     remove,
