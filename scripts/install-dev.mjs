@@ -31,10 +31,17 @@ const LEGACY_PKG_NAME = 'dsh-see-now';
 // `.tmp` / `.venv*` / `pip-*` / `__pycache__` 是本地产物，绝不能进 profile；
 // `debug` 是开发期调试窗，不进插件；`samples` / `test` / `.github` 也用不到。
 // 注意：`scripts` 必须保留 —— `scripts/audio-visual-runner.py` 是 pyannote 运行时依赖。
-const SKIP = new Set(['node_modules', '.git', '.github', 'test', '.tmp', 'debug', 'samples']);
+// `视频输出` / `素材图` 是本机视频工程的成片与素材（GB 级、上万帧），
+// `dsh-see-now` / `sense-now` 是 runner 在仓库根误建的同名缓存目录，
+// 它们都不属于插件运行时，进 profile 只会把安装体积从几 MB 撑到 2 GB 以上。
+const SKIP = new Set([
+  'node_modules', '.git', '.github', 'test', '.tmp', 'debug', 'samples',
+  '视频输出', '素材图', 'dsh-see-now', 'sense-now',
+]);
 const shouldSkip = (name) => SKIP.has(name)
   || name.startsWith('.venv')
   || name.startsWith('pip-')
+  || name.startsWith('torchinductor_')
   || name === '__pycache__';
 
 const mode = process.argv.includes('--remove') ? 'remove'
