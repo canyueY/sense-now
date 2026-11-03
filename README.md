@@ -1,4 +1,4 @@
-# Sense Now（见闻）
+﻿# Sense Now（见闻）
 
 [![CI](https://github.com/canyueY/sense-now/actions/workflows/ci.yml/badge.svg)](https://github.com/canyueY/sense-now/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
@@ -481,8 +481,8 @@ video-index/
 
 当前仓库验收基线：
 
-- 60 个 `*.test.mjs` 文件，`npm test`：**300 pass / 0 fail**。
-- GitHub Actions 在 Windows 和 Ubuntu 分别执行 Python `py_compile`、300 项 Node 测试与 `npm pack --dry-run --json`。
+- 61 个 `*.test.mjs` 文件，`npm test`：**303 pass / 0 fail**。
+- GitHub Actions 在 Windows 和 Ubuntu 分别执行 Python `py_compile`、303 项 Node 测试与 `npm pack --dry-run --json`。
 - npm pack：**120 个包内条目**，不包含 `.env`、`__pycache__`、`.pyc`、模型缓存和测试媒体。
 - 合成 / 注入级覆盖：流式 OCR 预算停 FFmpeg、probeOnly 分层、真后台 `indexAdaptive` 等 job 后检索片尾、`execute_refinement` 幂等、字幕下载 SSRF/Content-Type、`onDemandVisual` 探针等。
 - 6 小时 / 72 chunk benchmark 是合成数据下的检索基准，不是真实 OCR/ASR 吞吐 SLA。
@@ -526,7 +526,7 @@ src/
     adapters/                      字幕、ASR、OCR、VAD、pyannote、B 站等
 scripts/                           Python runners、bench、install-dev、smoke
 examples/floating-chat/            悬浮窗 bundle
-test/                              60 个测试文件 / 300 项测试
+test/                              61 个测试文件 / 303 项测试
 docs/                              方案、调参与复验文档
 ```
 
