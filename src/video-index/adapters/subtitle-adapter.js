@@ -156,6 +156,8 @@ export function normalizeSubtitles(raw = [], { videoKey, indexVersion, clock = (
     const endMs = Math.round(Number(s.endMs) || startMs);
     const ch = contentHash(`${startMs}|${endMs}|${text}`);
     const eid = evidenceIdOf({ videoKey, kind: 'subtitle', startMs, endMs, contentHash: ch });
+    const givenConf = Number(s.confidence);
+    const confidence = Number.isFinite(givenConf) ? givenConf : 1;
     const row = {
       startMs,
       endMs,
@@ -163,6 +165,8 @@ export function normalizeSubtitles(raw = [], { videoKey, indexVersion, clock = (
       lang: s.lang || null,
       evidenceId: eid,
       evidenceIds: [eid],
+      confidence,
+      sourceType: s.sourceType || (Number.isFinite(givenConf) ? 'ocr' : 'native'),
     };
     subtitles.push(row);
     utterances.push({
@@ -174,6 +178,8 @@ export function normalizeSubtitles(raw = [], { videoKey, indexVersion, clock = (
       speakerClusterId: null,
       evidenceId: eid,
       evidenceIds: [eid],
+      confidence,
+      sourceType: row.sourceType,
     });
     evidence.push(validateEvidenceRef({
       evidenceId: eid,

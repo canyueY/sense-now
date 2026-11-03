@@ -140,3 +140,88 @@ test('C7: 本地 probe 2h → background；2min → sync 短路径；未知时�
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('探测到时长后 metadata 与 coverage 不再是零', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sense-now-dur-'));
+  const path = join(root, 'clip.mp4');
+  writeFileSync(path, Buffer.from('x'));
+  try {
+    const eng = createVideoIndexEngine({
+      rootDir: root,
+      adapters: {
+        probeDuration: async () => 450_967,
+        extractFrames: async () => [],
+      },
+    });
+    const r = await eng.index({
+      source: {
+        kind: 'file',
+        path,
+        subtitles: [
+          { startMs: 0, endMs: 200_000, text: '前半' },
+          { startMs: 200_000, endMs: 400_000, text: '后半' },
+        ],
+      },
+    }, { skipStoryboard: true, analysisPolicy: {} });
+    const meta = eng.store.readPart(r.videoKey, eng.store.LAYOUT.metadata);
+    const cov = eng.store.readPart(r.videoKey, eng.store.LAYOUT.analysis.coverage);
+    assert.equal(meta.durationMs, 450_967);
+    assert.equal(cov.durationMs, 450_967);
+    assert.notEqual(cov.status, 'poor');
+    assert.ok(cov.textRanges.length > 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('时长探测失败时记录 duration_unknown', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sense-now-dur0-'));
+  const path = join(root, 'clip.mp4');
+  writeFileSync(path, Buffer.from('x'));
+  try {
+    const eng = createVideoIndexEngine({
+      rootDir: root,
+      adapters: {
+        probeDuration: async () => null,
+        extractFrames: async () => [],
+      },
+    });
+    const r = await eng.index({
+      source: {
+        kind: 'file',
+        path,
+        subtitles: [{ startMs: 0, endMs: 1000, text: '一句' }],
+      },
+    }, { skipStoryboard: true, analysisPolicy: {} });
+    assert.ok(r.videoKey);
+    const cov = eng.store.readPart(r.videoKey, eng.store.LAYOUT.analysis.coverage);
+    assert.ok((cov.limitReasons || []).includes('duration_unknown'));
+    assert.equal(cov.durationMs, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('chunk catalog 写出 duration 与 coverage', async () => {
+  const { createChunkStore } = await import('../src/video-index/chunk-store.js');
+  const root = mkdtempSync(join(tmpdir(), 'sense-now-catcov-'));
+  try {
+    const store = createChunkStore({ rootDir: root, videoKey: 'file:cov:a.mp4' });
+    store.commitChunk('000000', {
+      chunkManifest: {
+        chunkId: '000000', revision: 1, startMs: 0, endMs: 300_000, status: 'ready', sourceMode: 'file',
+      },
+      utterances: [{ startMs: 0, endMs: 250_000, text: '有字', confidence: 1 }],
+      events: [], speakers: [], storyboard: [], evidence: [], chapters: [],
+    });
+    const entries = store.rebuildCatalog();
+    assert.equal(entries[0].textConfidence, 1);
+    const catalog = store.readCatalog();
+    assert.equal(catalog.durationMs, 300_000);
+    assert.ok(catalog.coverage);
+    assert.notEqual(catalog.coverage.status, undefined);
+    assert.ok(catalog.coverage.textCoverageRatio > 0.7);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

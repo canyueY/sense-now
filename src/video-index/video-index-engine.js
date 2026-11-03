@@ -692,6 +692,7 @@ export function createVideoIndexEngine({
       subtitles: inlineSubtitles = null,
       analysisPolicy: rawPolicy = undefined,
       secondPassConfirmation = null,
+      durationMs: hintedDurationMs = null,
     } = options;
 
     aborted(signal);
@@ -788,6 +789,19 @@ export function createVideoIndexEngine({
     let subPack = { subtitles: [], utterances: [], evidence: [], chapters: [] };
     const wantSubs = (capOpts.subtitles || 'auto') !== 'off';
     const mediaPathEarly = mediaRef?.path || metadata.path || null;
+    let durationUnknown = false;
+    if (!(Number(metadata.durationMs) > 0)) {
+      const hinted = Number(hintedDurationMs);
+      if (Number.isFinite(hinted) && hinted > 0) {
+        metadata = { ...metadata, durationMs: hinted };
+      } else if (mediaPathEarly) {
+        const probed = await probeDuration(mediaPathEarly, { signal, ffmpegPath });
+        if (Number(probed) > 0) metadata = { ...metadata, durationMs: Number(probed) };
+        else durationUnknown = true;
+      } else {
+        durationUnknown = true;
+      }
+    }
     const durationMs = Number(metadata.durationMs) || Number(metadata.duration) * 1000 || 0;
 
     if (effectivePolicy && wantSubs) {
@@ -1222,8 +1236,15 @@ export function createVideoIndexEngine({
       }
     }
 
-    if (!coverage && durationMs) {
+    if ((!coverage || !(coverage.durationMs > 0) || !(coverage.textRanges || []).length) && durationMs > 0) {
       coverage = buildCoverage(subtitleSegments.length ? subtitleSegments : subPack.utterances, durationMs);
+    }
+    if (durationUnknown) {
+      coverage = coverage || buildCoverage([], 0);
+      coverage = {
+        ...coverage,
+        limitReasons: [...(coverage.limitReasons || []), 'duration_unknown'],
+      };
     }
 
     if (effectivePolicy?.profileSuggestion?.enabled !== false && effectivePolicy) {
@@ -2400,6 +2421,7 @@ export function createVideoIndexEngine({
       signal,
       capabilities,
       analysisPolicy: policyArg,
+      durationMs: prepared.durationMs,
     });
     return {
       ok: true,
