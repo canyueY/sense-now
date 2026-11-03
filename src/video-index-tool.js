@@ -13,6 +13,98 @@ import {
   sanitizeEvidenceIds,
 } from './video-index/evidence-package.js';
 import { TOOL_TIMEOUT_MS } from './tool-spec.js';
+import { estimateTextTokens } from './video-index/token-gate.js';
+
+/** query 可见 text 的硬上限（模型读不到 meta）。 */
+export const QUERY_TEXT_LIMITS = Object.freeze({
+  maxUtterances: 12,
+  maxChapters: 3,
+  maxCharsPerUtterance: 120,
+  maxTokens: 800,
+});
+
+function formatClock(ms) {
+  const total = Math.max(0, Math.floor(Number(ms) / 1000) || 0);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const mm = String(m).padStart(2, '0');
+  const ss = String(s).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+function foldUtteranceText(text, max = QUERY_TEXT_LIMITS.maxCharsPerUtterance) {
+  const flat = String(text || '').replace(/\s+/g, ' ').trim();
+  if (flat.length <= max) return flat;
+  return `${flat.slice(0, max)}…`;
+}
+
+function citeIds(ids) {
+  const list = [...new Set((ids || []).filter(Boolean))];
+  if (!list.length) return '';
+  if (list.length <= 2) return list.join(', ');
+  return `${list.slice(0, 2).join(', ')} +${list.length - 2}`;
+}
+
+/**
+ * 模型可见的 query 文本：摘要行 + 证据正文。不改 eng.query() 结构。
+ */
+export function formatQueryToolText(r = {}) {
+  const queryType = r.queryType || 'unknown';
+  const decision = r.decision || 'unknown';
+  const layout = r.layout || r.layoutVersion || 'index';
+  const visual = r.visualEvidence || [];
+  const utterances = [...(r.context?.utterances || [])].sort(
+    (a, b) => (Number(a.startMs) || 0) - (Number(b.startMs) || 0),
+  );
+  const chapters = [...(r.context?.chapters || [])].sort(
+    (a, b) => (Number(a.startMs) || 0) - (Number(b.startMs) || 0),
+  );
+  const header = [
+    `queryType=${queryType} decision=${decision} layout=${layout}`,
+    `reasons: ${(r.reasons || []).join(', ')}`,
+    `visual=${visual.length} cacheHit=${r.cache?.hit ? 'yes' : 'no'} truncated=${r.budget?.truncated ? 'true' : 'false'} omitted=${(r.budget?.omittedEvidenceIds || []).length}`,
+  ];
+  const visualTypes = new Set(['visual', 'multimodal']);
+  if (visualTypes.has(queryType)) {
+    const bits = visual.slice(0, 4).map((u) => {
+      const id = u.frameId || 'FRAME';
+      return `${id} @ ${formatClock(u.timestampMs)}`;
+    });
+    header.push(`visual evidence: ${visual.length} 帧${bits.length ? ` (${bits.join(', ')})` : ''}`);
+    return header.join('\n');
+  }
+  if (decision === 'insufficient') {
+    const hits = utterances.length;
+    const span = hits
+      ? `[${formatClock(utterances[0].startMs)}–${formatClock(utterances[hits - 1].endMs)}]`
+      : '[无命中时间段]';
+    header.push(`证据不足：仅命中 ${hits} 条 utterance，命中时间段 ${span}`);
+    return header.join('\n');
+  }
+  const lines = [...header, '--- chapters ---'];
+  for (const c of chapters.slice(0, QUERY_TEXT_LIMITS.maxChapters)) {
+    const ids = citeIds(c.evidenceIds);
+    lines.push(`[${formatClock(c.startMs)}–${formatClock(c.endMs)}] ${foldUtteranceText(c.title || c.summary || '章节', 80)}${ids ? ` (${ids})` : ''}`);
+  }
+  lines.push('--- utterances ---');
+  const shown = [];
+  for (const u of utterances) {
+    if (shown.length >= QUERY_TEXT_LIMITS.maxUtterances) break;
+    const id = u.evidenceId || (u.evidenceIds || [])[0] || '';
+    const line = `[${formatClock(u.startMs)}–${formatClock(u.endMs)}] ${foldUtteranceText(u.text)}${id ? ` (${id})` : ''}`;
+    const next = [...lines, ...shown, line].join('\n');
+    if (estimateTextTokens(next) > QUERY_TEXT_LIMITS.maxTokens && shown.length >= 2) break;
+    shown.push(line);
+  }
+  lines.push(...shown);
+  const omitted = utterances.length - shown.length;
+  if (omitted > 0) {
+    lines.push('--- omitted ---');
+    lines.push(`剩余 ${omitted} 条 utterance 未展开；需要哪一段请带更具体的时间或关键词再问`);
+  }
+  return lines.join('\n');
+}
 
 export function videoIndexToolSpec() {
   return {
@@ -342,16 +434,8 @@ export function createVideoIndexTool({
             }
           }
         }
-        const lines = [
-          `queryType=${r.queryType} decision=${r.decision}`,
-          `reasons: ${(r.reasons || []).join(', ')}`,
-          `chapters=${r.context?.chapters?.length || 0} events=${r.context?.events?.length || 0} utterances=${r.context?.utterances?.length || 0}`,
-          `visual=${r.visualEvidence?.length || 0} cacheHit=${r.cache?.hit ? 'yes' : 'no'}`,
-          r.budget?.truncated ? `truncated=true omitted=${(r.budget.omittedEvidenceIds || []).length}` : 'truncated=false',
-          '（索引层只返回证据与引用，请据此回答用户，不要把摘要当成唯一事实。）',
-        ];
         return toolResult({
-          text: lines.join('\n'),
+          text: formatQueryToolText(r),
           images,
           meta: toLosslessJson(r),
         });

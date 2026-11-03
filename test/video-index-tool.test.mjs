@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createVideoIndexTool } from '../src/video-index-tool.js';
+import { createVideoIndexTool, QUERY_TEXT_LIMITS } from '../src/video-index-tool.js';
 import {
   buildMinimalIndexPackage,
   buildFullEvidencePackage,
@@ -342,4 +342,121 @@ test('Full Evidence：maxTextTokens 与超长字段硬预算', () => {
     assert.ok(p.budget.limits.maxTextTokens <= FULL_EVIDENCE_HARD.maxTextTokens);
     assert.ok(Number.isFinite(p.budget.limits.maxTextTokens));
   }
+});
+
+test('query 文本通道包含带时间戳的台词与 EVID', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sense-now-qtext-'));
+  const path = join(root, 'clip.mp4');
+  writeFileSync(path, Buffer.from('x'));
+  const tool = createVideoIndexTool({
+    rootDir: root,
+    adapters: { extractFrames: async () => [] },
+  });
+  const r = await tool.engine.index({
+    source: {
+      kind: 'file',
+      path,
+      subtitles: [
+        { startMs: 10_000, endMs: 15_000, text: '后一句台词\n换行应折叠' },
+        { startMs: 4_000, endMs: 10_000, text: '先一句台词' },
+      ],
+    },
+  }, { skipStoryboard: true, rebuild: true });
+  const q = await tool.execute({
+    action: 'query',
+    videoKey: r.videoKey,
+    question: '讲了什么',
+  });
+  assert.equal(badJson(q), null);
+  assert.ok(q.meta?.citations);
+  const evids = [...q.text.matchAll(/EVID_[0-9a-f]+/g)].map((m) => m[0]);
+  assert.ok(evids.length >= 2);
+  const first = q.text.indexOf('先一句台词');
+  const second = q.text.indexOf('后一句台词');
+  assert.ok(first >= 0 && second > first, 'utterances 按 startMs 升序');
+  assert.equal(q.text.includes('\n\n'), false);
+  assert.match(q.text, /\[00:04–00:10\].*先一句台词/);
+  assert.ok(!q.text.includes('换行应折叠\n') && q.text.includes('后一句台词 换行应折叠'));
+});
+
+test('query 文本最多展开 12 条并报告省略数', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sense-now-qomit-'));
+  const path = join(root, 'clip.mp4');
+  writeFileSync(path, Buffer.from('x'));
+  const tool = createVideoIndexTool({
+    rootDir: root,
+    adapters: { extractFrames: async () => [] },
+  });
+  const subtitles = Array.from({ length: 30 }, (_, i) => ({
+    startMs: i * 1000,
+    endMs: i * 1000 + 800,
+    text: `台词${String(i).padStart(2, '0')}`,
+  }));
+  const r = await tool.engine.index({
+    source: { kind: 'file', path, subtitles },
+  }, { skipStoryboard: true, rebuild: true, budget: { maxUtterances: 40, maxTextTokens: 8000 } });
+  const q = await tool.execute({
+    action: 'query',
+    videoKey: r.videoKey,
+    question: '讲了什么',
+    budget: { maxUtterances: 40, maxTextTokens: 8000 },
+  });
+  const shown = (q.text.match(/台词\d{2}/g) || []).length;
+  assert.equal(shown, QUERY_TEXT_LIMITS.maxUtterances);
+  assert.match(q.text, /--- omitted ---\n剩余 18 条 utterance/);
+});
+
+test('visual 查询文本不展开台词', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'sense-now-qvis-'));
+  const path = join(root, 'clip.mp4');
+  writeFileSync(path, Buffer.from('x'));
+  const tool = createVideoIndexTool({
+    rootDir: root,
+    adapters: { extractFrames: async () => [] },
+  });
+  const r = await tool.engine.index({
+    source: {
+      kind: 'file',
+      path,
+      subtitles: [{ startMs: 0, endMs: 1000, text: '不该出现在视觉正文里的台词XYZ' }],
+    },
+  }, { skipStoryboard: true, rebuild: true });
+  const q = await tool.execute({
+    action: 'query',
+    videoKey: r.videoKey,
+    question: '画面里是什么',
+    mode: 'visual',
+  });
+  assert.match(q.text, /visual evidence:/);
+  assert.equal(q.text.includes('不该出现在视觉正文里的台词XYZ'), false);
+  assert.ok(q.meta);
+});
+
+test('证据不足时文本写明且不编造 EVID', async () => {
+  const tool = createVideoIndexTool({
+    rootDir: mkdtempSync(join(tmpdir(), 'sense-now-qins-')),
+    engine: {
+      query() {
+        return {
+          ok: true,
+          queryType: 'text_structure',
+          decision: 'insufficient',
+          reasons: ['no_hits'],
+          context: { chapters: [], events: [], utterances: [] },
+          visualEvidence: [],
+          citations: [],
+          budget: { truncated: false, omittedEvidenceIds: [] },
+          cache: { hit: false },
+        };
+      },
+    },
+  });
+  const q = await tool.execute({
+    action: 'query',
+    videoKey: 'file:none:empty.mp4',
+    question: '没有的内容',
+  });
+  assert.match(q.text, /证据不足/);
+  assert.equal(/EVID_/.test(q.text), false);
+  assert.ok(q.meta);
 });
