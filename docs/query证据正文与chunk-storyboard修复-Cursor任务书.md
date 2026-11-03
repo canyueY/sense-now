@@ -4,6 +4,18 @@
 > 所有“现状”结论都有可复现的索引产物路径与观测值，不需要重新猜。
 > 执行者请按 §3 的顺序做，一次只改一个 R 项，每项自带测试与验收。
 
+> **行号口径（PR #3 / #5 合入后）**：下文行号基于 `828c15f`（PR #3 之前）。合入后
+> `video-index-engine.js` 里相关实现整体下移约 50–65 行，`index-retriever.js` 有局部改动，
+> `video-index-tool.js` 的 query 文本通道已抽成 `formatQueryToolText()`。
+> 检索时请认这些标志串，而不是死记行号：`chunk_lightweight`（chunk 帧落盘）、
+> `durationUnknown` / `hintedDurationMs`（时长探测与传递）、`formatQueryToolText`（query 文本）、
+> `unlinkSync(... '.building.json')`（发布清理）、`parseTimeMs(question, durationMs)`（时间词）。
+
+> **素材说明**：本文与《端到端跑通报告》引用的 `视频输出/out/SenseNow_成片_带字幕.mp4`、
+> `SenseNow_字幕.srt` 是本机视频工程产物，已移出仓库。仓库内仍可直接用的是
+> `.tmp/release-smoke-2969d50/sense-now-real-441s.mkv`（441 s，**视轨全黑**、字幕与音频正常）；
+> 要验证 R2 的“画面内容”，请自备一段有画面的片段（例如 ffmpeg `testsrc`）。
+
 **一句话摘要**：`video_index` 现在**能建索引、能查计数，但 Agent 拿不到台词、画面问题出不了图、
 覆盖率把已索引的片子说成 poor、索引目录还留着构建标记**。四个修复点分别在
 `src/video-index-tool.js`（文本通道）、`src/video-index/video-index-engine.js`（chunk 帧落盘、时长探测）、
