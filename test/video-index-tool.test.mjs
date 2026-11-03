@@ -460,3 +460,31 @@ test('证据不足时文本写明且不编造 EVID', async () => {
   assert.equal(/EVID_/.test(q.text), false);
   assert.ok(q.meta);
 });
+
+test('索引没有文本证据时明确说明，而不是留两个空段', async () => {
+  const tool = createVideoIndexTool({
+    rootDir: mkdtempSync(join(tmpdir(), 'sense-now-qempty-')),
+    engine: {
+      query() {
+        return {
+          ok: true,
+          queryType: 'text_structure',
+          decision: 'llm',
+          reasons: [],
+          context: { chapters: [], events: [], utterances: [] },
+          visualEvidence: [],
+          citations: [],
+          budget: { truncated: false, omittedEvidenceIds: [] },
+          cache: { hit: false },
+        };
+      },
+    },
+  });
+  const q = await tool.execute({
+    action: 'query',
+    videoKey: 'file:empty:empty.mp4',
+    question: '这条视频讲了什么',
+  });
+  assert.match(q.text, /没有可引用的文本证据/);
+  assert.equal(q.text.includes('--- utterances ---'), false);
+});

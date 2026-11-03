@@ -82,6 +82,11 @@ export function formatQueryToolText(r = {}) {
     header.push(`证据不足：仅命中 ${hits} 条 utterance，命中时间段 ${span}`);
     return header.join('\n');
   }
+  if (!chapters.length && !utterances.length) {
+    header.push('没有可引用的文本证据：该索引没有产生字幕/ASR 文本。'
+      + '可在 index 时提供 subtitlePath，或开启 analysisPolicy.asr。');
+    return header.join('\n');
+  }
   const lines = [...header, '--- chapters ---'];
   for (const c of chapters.slice(0, QUERY_TEXT_LIMITS.maxChapters)) {
     const ids = citeIds(c.evidenceIds);
