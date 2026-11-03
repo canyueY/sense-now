@@ -41,7 +41,7 @@ function fieldScore(text, tokens, phrase, weight) {
   return { score, hits };
 }
 
-function parseTimeMs(question) {
+function parseTimeMs(question, durationMs = null) {
   const m = String(question).match(/(\d+):(\d{2})(?::(\d{2}))?/);
   if (m) {
     if (m[3] != null) {
@@ -53,6 +53,13 @@ function parseTimeMs(question) {
   if (sec) return Number(sec[1]) * 1000;
   const min = String(question).match(/(\d+)\s*分/);
   if (min) return Number(min[1]) * 60 * 1000;
+  // 片尾/结尾/开头这类词没有数字，必须用时长换算，否则视觉问题会一直命中片头
+  const q = String(question);
+  const dur = Number(durationMs);
+  if (/(片尾|结尾|末尾|最后|尾声|\bending\b|\bend\b)/i.test(q)) {
+    return Number.isFinite(dur) && dur > 0 ? Math.max(0, dur - 1) : null;
+  }
+  if (/(片头|开头|开始|首帧|\bbeginning\b|\bstart\b)/i.test(q)) return 0;
   return null;
 }
 
@@ -287,7 +294,7 @@ export function selectChunksFromCatalog(catalog, {
     : (Array.isArray(catalog) ? catalog : []);
   const tokens = tokenize(question);
   const phrase = normalize(question);
-  const atMs = parseTimeMs(question);
+  const atMs = parseTimeMs(question, Number(catalog?.durationMs) || null);
 
   // 泛问：不得只加载 Top 2～3；改走时间覆盖代表块
   if (atMs == null && isOverviewQuestion(question, queryType)) {
@@ -412,7 +419,7 @@ export function retrieve(index, {
 } = {}) {
   const tokens = tokenize(question);
   const phrase = normalize(question);
-  const atMs = parseTimeMs(question);
+  const atMs = parseTimeMs(question, Number(index.metadata?.durationMs) || Number(index.durationMs) || null);
   const details = [];
   const extraReasons = [];
 

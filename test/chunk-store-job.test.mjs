@@ -347,3 +347,55 @@ test('旧 chunk 无图时视觉查询标记 storyboard_missing_images', async ()
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('index({rebuild:true}) 在 chunk 路径真的重跑，而不是复用 ready chunk', async () => {
+  const root = tmp();
+  const media = join(root, 'clip.mp4');
+  writeFileSync(media, Buffer.from('fake'));
+  // 两轮用不同像素；contentHash 变了，frameId 必然变，能证明 chunk 被重建
+  let fill = 12;
+  try {
+    const engine = createVideoIndexEngine({
+      rootDir: root,
+      adapters: {
+        fileSource: {
+          resolve: async () => ({
+            videoKey: 'file:rebuild:clip.mp4',
+            metadata: { durationMs: 15 * 60_000, path: media, title: 'clip.mp4' },
+            mediaRef: { path: media },
+            subtitles: [],
+          }),
+        },
+        probeDuration: async () => 15 * 60_000,
+        extractFrames: async () => [{
+          buf: Buffer.alloc(320 * 180 * 3, fill), timestampMs: 1000, t: 1, width: 320, height: 180,
+        }],
+        extractAudio: async () => { throw new Error('no audio'); },
+      },
+    });
+    const first = await engine.indexAdaptive({
+      source: { kind: 'file', path: media },
+      execution: 'background',
+    });
+    await waitJob(engine, first.jobId);
+    const store = createChunkStore({ rootDir: root, videoKey: first.videoKey });
+    const before = store.readChunk('000000').storyboard[0].frameId;
+
+    fill = 200;
+    const second = await engine.indexAdaptive({
+      source: { kind: 'file', path: media },
+      execution: 'background',
+      indexOptions: { rebuild: true },
+    });
+    const st = await waitJob(engine, second.jobId);
+    assert.ok(['ready', 'degraded'].includes(st.job.state));
+    const after = store.readChunk('000000').storyboard[0].frameId;
+    assert.notEqual(after, before, 'rebuild 必须产出新的帧');
+
+    // 旧帧不能留成孤儿
+    const frames = readdirSync(join(store.videoDir, 'evidence', 'frames'));
+    assert.deepEqual(frames, [`${after}.png`]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

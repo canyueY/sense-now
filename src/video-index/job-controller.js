@@ -4,6 +4,8 @@
 
 import { createJobStore } from './job-store.js';
 import { createChunkStore } from './chunk-store.js';
+import { rmSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   planChunks, LAYOUT_VERSION, ownsByMidpoint, dedupeUtterancesAcrossOverlap,
 } from './chunk-plan.js';
@@ -99,6 +101,7 @@ export function createJobController({
     overlapMs,
     speakerMerge: mergeOpts = null,
     analysisPolicy = undefined,
+    rebuild = false,
   } = {}) {
     const plan = planChunks({ durationMs, chunkMs, overlapMs });
     const background = estimateNeedsBackground(durationMs, execution);
@@ -115,6 +118,10 @@ export function createJobController({
       analysisPolicy,
     });
     const chunkStore = createChunkStore({ rootDir, videoKey });
+    // rebuild：清掉上一轮的帧，否则旧 PNG 会成为没人引用、也不会被覆盖的孤儿
+    if (rebuild) {
+      try { rmSync(join(chunkStore.videoDir, 'evidence', 'frames'), { recursive: true, force: true }); } catch { /* ignore */ }
+    }
     try {
       writeSourceRef(chunkStore.videoDir, safeRef, { clock: () => new Date(clock()).toISOString() });
     } catch (e) {
@@ -169,6 +176,7 @@ export function createJobController({
       lockNonce: lock.lock?.nonce || null,
       speakerMergeOpts: mergeOpts || speakerMerge || null,
       analysisPolicy,
+      rebuild,
     });
 
     if (background) {
@@ -205,6 +213,7 @@ export function createJobController({
   async function runIndexingJob({
     jobId, videoKey, plan, sourceMode, sourceDescriptor, capabilities,
     attempt = 1, lockNonce = null, speakerMergeOpts = null, analysisPolicy = undefined,
+    rebuild = false,
   }) {
     const ac = new AbortController();
     live.set(jobId, { abort: ac, attempt, lockNonce });
@@ -244,7 +253,9 @@ export function createJobController({
       }
 
       const existing = store.readChunk(chunk.chunkId, { optional: true });
-      if (existing?.manifest?.status === 'ready' || existing?.manifest?.status === 'degraded') {
+      // rebuild 时不能复用旧 chunk，否则 index({rebuild:true}) 会静默 no-op
+      if (!rebuild
+        && (existing?.manifest?.status === 'ready' || existing?.manifest?.status === 'degraded')) {
         ready += existing.manifest.status === 'ready' ? 1 : 0;
         degraded += existing.manifest.status === 'degraded' ? 1 : 0;
         indexedMs += chunk.endMs - chunk.startMs;

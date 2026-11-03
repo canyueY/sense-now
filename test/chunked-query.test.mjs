@@ -71,3 +71,39 @@ test('chunked index：list/status 可见，query 带回 speakers/timeRanges', ()
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('片尾/开头这类时间词要路由到对应 chunk', () => {
+  const root = mkdtempSync(join(tmpdir(), 'sense-now-timewords-'));
+  try {
+    const videoKey = 'file:timewords:clip.mp4';
+    const store = createChunkStore({ rootDir: root, videoKey });
+    for (const [chunkId, start] of [['000000', 0], ['000001', 300_000]]) {
+      store.commitChunk(chunkId, {
+        chunkManifest: {
+          chunkId,
+          revision: 1,
+          startMs: start,
+          endMs: start + 300_000,
+          status: 'ready',
+          sourceMode: 'file',
+          timeSource: 'stream',
+        },
+        utterances: [],
+        events: [],
+        speakers: [],
+        storyboard: [],
+        evidence: [],
+        chapters: [],
+      });
+    }
+    store.rebuildCatalog();
+    const engine = createVideoIndexEngine({ rootDir: root, adapters: {} });
+
+    const end = engine.query({ videoKey, question: '片尾的画面里有什么', mode: 'visual' });
+    assert.equal(end.chunksLoaded[0], '000001', '片尾必须命中最后一块（相邻块允许作为上下文）');
+    const start = engine.query({ videoKey, question: '开头第一屏是什么', mode: 'visual' });
+    assert.equal(start.chunksLoaded[0], '000000', '开头必须命中第一块');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
