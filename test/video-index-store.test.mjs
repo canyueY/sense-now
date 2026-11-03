@@ -98,6 +98,62 @@ test('损坏 JSON 与临时文件不破坏 list', () => {
   assert.ok(!listed.some((x) => x.videoKey === videoKey));
 });
 
+test('成功提交后不留下 .building.json', () => {
+  const root = tmpRoot();
+  const store = createIndexStore({ rootDir: root });
+  const videoKey = 'file:abc:demo.mp4';
+  const building = createBuildingManifest({
+    videoKey,
+    source: { kind: 'file', path: 'demo.mp4' },
+    indexVersion: 'v1',
+    clock: () => '2026-01-01T00:00:00.000Z',
+  });
+  store.writePart(videoKey, '.building.json', building);
+  store.commit(videoKey, {
+    manifest: {
+      ...building,
+      status: 'ready',
+      capabilities: { ...building.capabilities, metadata: 'ready' },
+    },
+    metadata: { title: 'demo', fingerprint: 'fp1' },
+    chapters: [],
+    utterances: [],
+    events: [],
+    subtitles: [],
+    evidenceIndex: [],
+    storyboardIndex: [],
+  });
+  assert.equal(existsSync(join(store.videoDir(videoKey), '.building.json')), false);
+});
+
+test('残留 .building.json 不把 ready 降成 building', () => {
+  const root = tmpRoot();
+  const store = createIndexStore({ rootDir: root });
+  const videoKey = 'file:abc:ready.mp4';
+  const building = createBuildingManifest({
+    videoKey,
+    source: { kind: 'file', path: 'ready.mp4' },
+    indexVersion: 'v1',
+    clock: () => '2026-01-01T00:00:00.000Z',
+  });
+  store.commit(videoKey, {
+    manifest: {
+      ...building,
+      status: 'ready',
+      capabilities: { ...building.capabilities, metadata: 'ready' },
+    },
+    metadata: { title: 'ready' },
+    chapters: [],
+    utterances: [],
+    events: [],
+    subtitles: [],
+    evidenceIndex: [],
+    storyboardIndex: [],
+  });
+  writeFileSync(join(store.videoDir(videoKey), '.building.json'), JSON.stringify({ status: 'building' }));
+  assert.equal(store.status(videoKey).status, 'ready');
+});
+
 test('resolveEvidenceFile 拒绝越界路径', () => {
   const root = tmpRoot();
   const store = createIndexStore({ rootDir: root });
