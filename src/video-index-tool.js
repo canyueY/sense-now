@@ -14,6 +14,7 @@ import {
 } from './video-index/evidence-package.js';
 import { TOOL_TIMEOUT_MS } from './tool-spec.js';
 import { estimateTextTokens } from './video-index/token-gate.js';
+import { labelForUtterance, listCharacterIdentities, characterIdentityDetail } from './video-index/character-identity.js';
 
 /** query 可见 text 的硬上限（模型读不到 meta）。 */
 export const QUERY_TEXT_LIMITS = Object.freeze({
@@ -22,6 +23,28 @@ export const QUERY_TEXT_LIMITS = Object.freeze({
   maxCharsPerUtterance: 120,
   maxTokens: 800,
 });
+
+function identityInputError(kind, args) {
+  const need = (key) => (args?.[key] ? null : `缺少 ${key}`);
+  if (kind === 'detail' || kind === 'rename') {
+    const err = need('personId');
+    if (err) return err;
+  }
+  if (kind === 'rename' && !args.displayName && !args.name) return '缺少 displayName';
+  if (kind === 'confirm' && !args.personId) return '缺少 personId';
+  if (kind === 'link' || kind === 'unlink' || kind === 'split') {
+    if (!args.personId) return '缺少 personId';
+    if (!args.speakerId) return '缺少 speakerId';
+  }
+  if (kind === 'merge') {
+    if (!args.keepPersonId) return '缺少 keepPersonId';
+    if (!args.dropPersonId) return '缺少 dropPersonId';
+  }
+  if (kind === 'deny' && !args.relationId && !(args.personId && args.speakerId)) {
+    return 'deny 需要 relationId，或同时提供 personId 与 speakerId';
+  }
+  return null;
+}
 
 function formatClock(ms) {
   const total = Math.max(0, Math.floor(Number(ms) / 1000) || 0);
@@ -97,7 +120,10 @@ export function formatQueryToolText(r = {}) {
   for (const u of utterances) {
     if (shown.length >= QUERY_TEXT_LIMITS.maxUtterances) break;
     const id = u.evidenceId || (u.evidenceIds || [])[0] || '';
-    const line = `[${formatClock(u.startMs)}–${formatClock(u.endMs)}] ${foldUtteranceText(u.text)}${id ? ` (${id})` : ''}`;
+    const who = labelForUtterance(r.characterIdentity, u);
+    const body = foldUtteranceText(u.text);
+    const spoken = who ? `${who}：${body}` : body;
+    const line = `[${formatClock(u.startMs)}–${formatClock(u.endMs)}] ${spoken}${id ? ` (${id})` : ''}`;
     const next = [...lines, ...shown, line].join('\n');
     if (estimateTextTokens(next) > QUERY_TEXT_LIMITS.maxTokens && shown.length >= 2) break;
     shown.push(line);
@@ -129,7 +155,11 @@ export function videoIndexToolSpec() {
       + '- `execute_refinement` — confirm and run a query-emitted on_demand ASR plan (planHash + confirmation:true). '
       + 'Does not invent ASR when asr.mode=off; idempotent for the same planHash.\n'
       + '- `cleanup` — purge temp files and expired query cache; optional maxAgeMs to drop old indexes; '
-      + 'optional purgeTrash (requires confirmDelete) to remove .__trash-* recovery copies when live index is valid.\n\n'
+      + 'optional purgeTrash (requires confirmDelete) to remove .__trash-* recovery copies when live index is valid.\n'
+      + '- `identity_resolve` / `identity_list` / `identity_detail` / `identity_confirm` / `identity_deny` / '
+      + '`identity_rename` / `identity_link` / `identity_unlink` / `identity_merge` / `identity_split` / `identity_undo` — '
+      + 'per-video character identity. Unknown stays unknown until evidence or the user confirms. '
+      + 'These actions do not rewrite subtitle or ASR text.\n\n'
       + 'This is separate from live `sense_now` watching. Indexing does not wake the model. '
       + 'Long videos use execution:auto|background and return jobId immediately. '
       + 'Text questions return citations without images; visual questions prefer existing storyboard frames. '
@@ -137,7 +167,7 @@ export function videoIndexToolSpec() {
     parameters: {
       action: {
         type: 'string',
-        description: 'index | query | evidence | zoom | status | list | remove | cleanup | job_status | job_cancel | job_resume | capture_start | capture_stop | refine | execute_refinement',
+        description: 'index | query | evidence | zoom | status | list | remove | cleanup | job_status | job_cancel | job_resume | capture_start | capture_stop | refine | execute_refinement | identity_resolve | identity_list | identity_detail | identity_confirm | identity_deny | identity_rename | identity_link | identity_unlink | identity_merge | identity_split | identity_undo',
       },
       planHash: {
         type: 'string',
@@ -187,7 +217,7 @@ export function videoIndexToolSpec() {
       },
       capabilities: {
         type: 'json',
-        description: 'With index: adapter capability switches such as { asr:"on", diarization:"on", identityBinding:"on" }. Legacy asr off|auto|on maps to analysisPolicy.asr.mode when analysisPolicy is also set.',
+        description: 'With index: adapter capability switches such as { asr:"on", diarization:"on", identityBinding:"on", characterIdentity:"on" }. characterIdentity defaults off. Legacy asr off|auto|on maps to analysisPolicy.asr.mode when analysisPolicy is also set.',
       },
       analysisPolicy: {
         type: 'json',
@@ -207,8 +237,27 @@ export function videoIndexToolSpec() {
       },
       identityObservations: {
         type: 'array',
-        description: 'With index: optional face/speaker observations used by identity binding',
+        description: 'With index / identity_resolve: optional observations. Does not run a face or speaker model by itself.',
       },
+      visualTracks: {
+        type: 'array',
+        description: 'With index / identity_resolve: caller-supplied visual tracks. Not produced by this tool.',
+      },
+      voiceMatches: {
+        type: 'array',
+        description: 'With index / identity_resolve: caller-supplied voice match results. Not produced by this tool.',
+      },
+      sceneHints: {
+        type: 'array',
+        description: 'With index / identity_resolve: optional scene hints such as phone or off-screen.',
+      },
+      personId: { type: 'string', description: 'With identity_detail / confirm / deny / rename / link / unlink / split' },
+      speakerId: { type: 'string', description: 'With identity_confirm / deny / link / unlink / split' },
+      displayName: { type: 'string', description: 'With identity_rename, or the name used by identity_confirm' },
+      relationId: { type: 'string', description: 'With identity_deny / identity_unlink' },
+      keepPersonId: { type: 'string', description: 'With identity_merge: person id to keep' },
+      dropPersonId: { type: 'string', description: 'With identity_merge: person id to drop' },
+      name: { type: 'string', description: 'Alias of displayName for identity_confirm' },
       budget: { type: 'json', description: 'Optional budget overrides' },
       evidenceIds: { type: 'array', description: 'Evidence ids for evidence/full package' },
       startMs: { type: 'integer', description: 'Range start' },
@@ -376,6 +425,9 @@ export function createVideoIndexTool({
               identityObservations: Array.isArray(args.identityObservations)
                 ? args.identityObservations
                 : [],
+              visualTracks: Array.isArray(args.visualTracks) ? args.visualTracks : [],
+              sceneHints: Array.isArray(args.sceneHints) ? args.sceneHints : [],
+              voiceMatches: Array.isArray(args.voiceMatches) ? args.voiceMatches : [],
               analysisPolicy: args.analysisPolicy !== undefined ? args.analysisPolicy : undefined,
             },
           });
@@ -752,12 +804,81 @@ export function createVideoIndexTool({
             : (r.ok
               ? `已执行 on_demand ASR refinement（planHash=${planHash}，revision ${r.beforeRevision}→${r.afterRevision}）。`
               : `execute_refinement 失败：${r.reason || r.detail}`),
-          meta: toLosslessJson(r),
+        meta: toLosslessJson(r),
+      };
+    }
+
+    if (typeof action === 'string' && action.startsWith('identity_')) {
+      const videoKey = args.videoKey;
+      if (!videoKey) {
+        return { text: '需要 videoKey。', meta: { ok: false, reason: 'missing_videoKey' } };
+      }
+      const kind = action.slice('identity_'.length);
+      const missing = identityInputError(kind, args);
+      if (missing) {
+        return { text: missing, meta: { ok: false, reason: 'invalid_input', error: missing } };
+      }
+      if (kind === 'resolve') {
+        const r = eng.resolveStoredCharacterIdentity(videoKey, {
+          ...(Array.isArray(args.visualTracks) ? { visualTracks: args.visualTracks } : {}),
+          ...(Array.isArray(args.identityObservations) ? { observations: args.identityObservations } : {}),
+          ...(Array.isArray(args.sceneHints) ? { sceneHints: args.sceneHints } : {}),
+          ...(Array.isArray(args.voiceMatches) ? { voiceMatches: args.voiceMatches } : {}),
+          force: true,
+        });
+        return {
+          text: r.ok
+            ? `已解析人物身份 ${videoKey}，revision ${r.registry.revision}，人物 ${r.registry.persons.length}，说话人 ${r.registry.speakers.length}。`
+            : `身份解析失败：${r.reason}`,
+          meta: r,
         };
       }
-
+      if (kind === 'list') {
+        const registry = eng.store.readCharacterIdentity(videoKey);
+        const people = listCharacterIdentities(registry);
+        return {
+          text: people.length
+            ? people.map((p) => `${p.displayName}｜${p.status}${p.verification ? `/${p.verification}` : ''}${p.conflict ? '｜冲突' : ''}`).join('\n')
+            : '还没有人物身份。先 identity_resolve，或在 index 时设置 capabilities.characterIdentity=on。',
+          meta: { ok: Boolean(registry), persons: people },
+        };
+      }
+      if (kind === 'detail') {
+        const registry = eng.store.readCharacterIdentity(videoKey);
+        const detail = characterIdentityDetail(registry, args.personId);
+        if (!detail) return { text: '没有这个人物。', meta: { ok: false, reason: 'not_found' } };
+        const lines = [
+          `${detail.person.display_name}｜${detail.person.identity_status}`,
+          `支持证据 ${detail.support.length}，反对证据 ${detail.oppose.length}`,
+        ];
+        for (const ev of detail.support.slice(0, 8)) {
+          lines.push(`- ${ev.evidence_type} @ ${ev.timestamp_start}ms ${ev.observed_value}`);
+        }
+        return { text: lines.join('\n'), meta: { ok: true, detail } };
+      }
+      const op = {
+        list: null,
+        confirm: { type: 'confirm', personId: args.personId, speakerId: args.speakerId, name: args.displayName || args.name },
+        deny: { type: 'deny', relationId: args.relationId, personId: args.personId, speakerId: args.speakerId },
+        rename: { type: 'rename', personId: args.personId, displayName: args.displayName },
+        link: { type: 'link', personId: args.personId, speakerId: args.speakerId },
+        unlink: { type: 'unlink', personId: args.personId, speakerId: args.speakerId, relationId: args.relationId },
+        merge: { type: 'merge', keepPersonId: args.keepPersonId, dropPersonId: args.dropPersonId },
+        split: { type: 'split', personId: args.personId, speakerId: args.speakerId },
+        undo: { type: 'undo' },
+      }[kind];
+      if (!op) {
+        return { text: `未知身份操作：${action}`, meta: { ok: false, reason: 'unknown_action' } };
+      }
+      const r = eng.updateCharacterIdentity(videoKey, op);
       return {
-        text: `未知 action: ${action}（可用 index / query / evidence / zoom / status / list / remove / cleanup / job_* / capture_* / refine / execute_refinement）`,
+        text: r.ok ? `已更新人物身份，revision ${r.registry.revision}。原始字幕和 ASR 文本没有改写。` : `身份更新失败：${r.reason}`,
+        meta: r,
+      };
+    }
+
+    return {
+        text: `未知 action: ${action}（可用 index / query / evidence / zoom / status / list / remove / cleanup / job_* / capture_* / refine / execute_refinement / identity_*）`,
         meta: { action },
       };
     },

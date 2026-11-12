@@ -28,6 +28,7 @@ import { createQueryCache, cacheKeyOf, RETRIEVAL_VERSION } from './query-cache.j
 import { evaluateCognition } from './cognition-gate.js';
 import { mergeBudget } from './schema.js';
 import { resolveIdentities } from './identity-resolver.js';
+import { resolveCharacterIdentity } from './character-identity.js';
 import { evidenceLogicalRef, decodeVideoKeyDir } from './paths.js';
 import {
   extractAudioWav, defaultCacheAudioPath, defaultCacheMediaPath, probeMediaDurationMs,
@@ -85,6 +86,35 @@ import { spawnSync } from 'node:child_process';
 import {
   attachIndexOptionsToDescriptor, readSourceRef,
 } from './source-ref.js';
+
+function pickIdentityList(primary, fallback) {
+  if (Array.isArray(primary) && primary.length) return primary;
+  return Array.isArray(fallback) ? fallback : [];
+}
+
+function scopeChunkSpeaker(utterance, speakerMap) {
+  const local = utterance?.speakerClusterId;
+  if (!local || !utterance.chunkId) return utterance;
+  const globalId = speakerMap?.[local]?.globalSpeakerId;
+  if (globalId) {
+    return { ...utterance, localSpeakerId: local, speakerClusterId: globalId };
+  }
+  return { ...utterance, localSpeakerId: local, speakerClusterId: `${utterance.chunkId}:${local}` };
+}
+
+function withIdentityExtras(descriptor, indexOptions = {}, capabilities = {}) {
+  const d = { ...(descriptor || {}) };
+  const cap = capabilities?.characterIdentity || indexOptions?.capabilities?.characterIdentity;
+  if (cap !== 'on') return d;
+  if (indexOptions.characterIdentityFault) d.characterIdentityFault = indexOptions.characterIdentityFault;
+  d.characterIdentityExtras = {
+    visualTracks: indexOptions.visualTracks || [],
+    observations: indexOptions.identityObservations || [],
+    sceneHints: indexOptions.sceneHints || [],
+    voiceMatches: indexOptions.voiceMatches || [],
+  };
+  return d;
+}
 
 function aborted(signal) {
   if (signal?.aborted) {
@@ -664,6 +694,13 @@ export function createVideoIndexEngine({
     },
     clock: () => Date.now(),
     log,
+    onIndexed: ({ videoKey, capabilities, state, sourceDescriptor }) => {
+      if (capabilities?.characterIdentity !== 'on') return null;
+      if (state !== 'ready' && state !== 'degraded') return null;
+      const extras = { ...(sourceDescriptor?.characterIdentityExtras || {}) };
+      if (sourceDescriptor?.characterIdentityFault) extras.fault = sourceDescriptor.characterIdentityFault;
+      return resolveStoredCharacterIdentity(videoKey, extras);
+    },
   });
 
   async function resolveSource(input, { signal, downloadMedia = false, cachePath = null } = {}) {
@@ -746,6 +783,9 @@ export function createVideoIndexEngine({
       retrieval: RETRIEVAL_VERSION,
       profile,
     });
+
+    const previousDecisions = store.readIdentityDecisions(videoKey);
+    const previousIdentity = store.readCharacterIdentity(videoKey);
 
     // 整个重建写在 staging；成功后原子切换，避免旧 ready 指向混合数据
     store.beginStaging(videoKey);
@@ -1309,6 +1349,50 @@ export function createVideoIndexEngine({
       caps.evidenceAudit = 'skipped';
     }
 
+    let characterIdentity = null;
+    let identityDecisions = null;
+    const identityEnabled = capOpts.characterIdentity === 'on';
+    if (identityEnabled || previousDecisions || previousIdentity) {
+      if (!identityEnabled || options.characterIdentityFault === 'throw') {
+        characterIdentity = previousIdentity;
+        identityDecisions = previousDecisions;
+        if (identityEnabled) {
+          caps.characterIdentity = 'degraded';
+          status = 'degraded';
+          log('character identity skipped: fault');
+        }
+      } else {
+        try {
+          const savedExtras = previousIdentity?.extras || {};
+          characterIdentity = resolveCharacterIdentity({
+            videoId: videoKey,
+            clock,
+            utterances: subPack.utterances,
+            visualTracks: pickIdentityList(options.visualTracks, savedExtras.visualTracks),
+            observations: pickIdentityList(identityObservations, savedExtras.observations),
+            sceneHints: pickIdentityList(options.sceneHints, savedExtras.sceneHints),
+            voiceMatches: pickIdentityList(options.voiceMatches, savedExtras.voiceMatches),
+            userActions: previousDecisions?.actions || previousIdentity?.userActions || [],
+            prior: previousIdentity,
+            force: true,
+          });
+          identityDecisions = {
+            schemaVersion: 1,
+            videoId: videoKey,
+            actions: characterIdentity.userActions || [],
+            pending: characterIdentity.pendingActions || [],
+          };
+          caps.characterIdentity = 'ready';
+        } catch (e) {
+          characterIdentity = previousIdentity;
+          identityDecisions = previousDecisions;
+          caps.characterIdentity = 'degraded';
+          status = 'degraded';
+          log(`character identity failed: ${e.message}`);
+        }
+      }
+    }
+
     const now = clock();
     const manifest = validateManifest({
       ...building,
@@ -1363,6 +1447,8 @@ export function createVideoIndexEngine({
       recommendations: recommendations.length ? { items: recommendations } : undefined,
       effectivePolicy: effectivePolicy || undefined,
       audit: auditResult || undefined,
+      characterIdentity: characterIdentity || undefined,
+      identityDecisions: identityDecisions || undefined,
     });
 
     return {
@@ -1749,11 +1835,17 @@ export function createVideoIndexEngine({
         chunkId: c.chunkId,
         revision: c.manifest?.revision,
       })));
+      const identityToken = (() => {
+        try {
+          const reg = store.readCharacterIdentity(videoKey);
+          return reg?.revision ? `cid:${reg.revision}` : '';
+        } catch { return ''; }
+      })();
       const key = cacheKeyOf({
         videoKey,
         indexVersion: catalog.layoutVersion || LAYOUT_VERSION,
         layoutVersion: LAYOUT_VERSION,
-        chunkRevisionHash: revHash,
+        chunkRevisionHash: identityToken ? `${revHash}|${identityToken}` : revHash,
         queryType: routed.queryType,
         question,
         budget: limits,
@@ -1762,7 +1854,11 @@ export function createVideoIndexEngine({
       });
       const cached = cache.get(videoKey, key, { indexVersion: catalog.layoutVersion || LAYOUT_VERSION });
       if (cached.hit) {
-        return { ...cached.value, cache: { hit: true, key }, chunksLoaded: selected.chunkIds };
+        return attachCharacterIdentity(videoKey, {
+          ...cached.value,
+          cache: { hit: true, key },
+          chunksLoaded: selected.chunkIds,
+        });
       }
       const chunkStoryboardCap = loaded.length
         && loaded.every((c) => c.manifest?.capabilities?.storyboard === 'skipped')
@@ -1815,6 +1911,7 @@ export function createVideoIndexEngine({
         durationMs: catalog.durationMs || 0,
         videoKey,
       });
+      result = attachCharacterIdentity(videoKey, result);
       cache.set(videoKey, key, result, { indexVersion: catalog.layoutVersion || LAYOUT_VERSION });
       return result;
     }
@@ -1851,6 +1948,12 @@ export function createVideoIndexEngine({
       maxUtterances: limits.maxUtterances,
     });
 
+    const identityToken = (() => {
+      try {
+        const reg = store.readCharacterIdentity(videoKey);
+        return reg?.revision ? `cid:${reg.revision}` : '';
+      } catch { return ''; }
+    })();
     const key = cacheKeyOf({
       videoKey,
       indexVersion: indexData.manifest.indexVersion,
@@ -1859,11 +1962,12 @@ export function createVideoIndexEngine({
       budget: limits,
       relevantEvidenceIds: retrieval.evidenceIds,
       retrievalVersion: RETRIEVAL_VERSION,
+      chunkRevisionHash: identityToken || null,
     });
 
     const cached = cache.get(videoKey, key, { indexVersion: indexData.manifest.indexVersion });
     if (cached.hit) {
-      return { ...cached.value, cache: { hit: true, key } };
+      return attachCharacterIdentity(videoKey, { ...cached.value, cache: { hit: true, key } });
     }
 
     const built = buildContext({
@@ -1907,6 +2011,7 @@ export function createVideoIndexEngine({
       videoKey,
     });
 
+    result = attachCharacterIdentity(videoKey, result);
     cache.set(videoKey, key, result, { indexVersion: indexData.manifest.indexVersion });
     return result;
   }
@@ -2268,13 +2373,13 @@ export function createVideoIndexEngine({
     const prepared = await prepareSourceForIndex({
       source, durationMs, videoKey, mediaPath, signal,
     });
-    const sourceDescriptor = attachIndexOptionsToDescriptor(
+    const sourceDescriptor = withIdentityExtras(attachIndexOptionsToDescriptor(
       {
         ...(prepared.sourceDescriptor || {}),
         durationMs: prepared.durationMs,
       },
       indexOptions,
-    );
+    ), indexOptions, capabilities);
     const r = await jobs.startIndexJob({
       videoKey: prepared.videoKey,
       durationMs: prepared.durationMs,
@@ -2389,13 +2494,13 @@ export function createVideoIndexEngine({
     // URL 已持有内存 descriptor：后台或同步分块都走 startIndexJob，避免二次 resolveStreams
     if (needBg || exec === 'background' || prepared.sourceMode === 'url' || exec === 'sync') {
       // 外挂字幕等 indexOptions 必须并入 descriptor，否则后台 chunk 拿不到 subtitlePath
-      const sourceDescriptor = attachIndexOptionsToDescriptor(
+      const sourceDescriptor = withIdentityExtras(attachIndexOptionsToDescriptor(
         {
           ...(prepared.sourceDescriptor || {}),
           durationMs: prepared.durationMs,
         },
         indexOptions,
-      );
+      ), indexOptions, capabilities);
       const r = await jobs.startIndexJob({
         videoKey: prepared.videoKey,
         durationMs: prepared.durationMs,
@@ -2960,6 +3065,88 @@ export function createVideoIndexEngine({
     }
   }
 
+  function attachCharacterIdentity(videoKey, result) {
+    if (!result || result.ok === false) return result;
+    let identity = null;
+    try { identity = store.readCharacterIdentity(videoKey); } catch { identity = null; }
+    if (!identity) {
+      if (!Object.prototype.hasOwnProperty.call(result, 'characterIdentity')) return result;
+      const { characterIdentity, ...rest } = result;
+      void characterIdentity;
+      return rest;
+    }
+    return { ...result, characterIdentity: identity };
+  }
+
+  function collectIdentityMaterial(videoKey) {
+    const loaded = loadQueryableIndex(videoKey);
+    if (!loaded.ok) return { ok: false, reason: loaded.reason || 'not-found' };
+    let utterances = loaded.index?.utterances || [];
+    if (loaded.layout === 'chunk_catalog') {
+      let map = null;
+      try { map = readSpeakerMap(store.videoDir(videoKey))?.speakers || null; } catch { map = null; }
+      utterances = utterances.map((u) => scopeChunkSpeaker(u, map));
+    }
+    return { ok: true, utterances, layout: loaded.layout };
+  }
+
+  function resolveStoredCharacterIdentity(videoKey, extras = {}) {
+    const decisionsBefore = store.readIdentityDecisions(videoKey);
+    const prior = store.readCharacterIdentity(videoKey);
+    const material = collectIdentityMaterial(videoKey);
+    if (!material.ok) return material;
+    if (extras.fault === 'throw') {
+      return { ok: false, reason: 'character_identity_fault', decisions: decisionsBefore };
+    }
+    try {
+      const savedExtras = prior?.extras || {};
+      const registry = resolveCharacterIdentity({
+        videoId: videoKey,
+        clock,
+        utterances: material.utterances,
+        visualTracks: pickIdentityList(extras.visualTracks, savedExtras.visualTracks),
+        observations: pickIdentityList(extras.observations, savedExtras.observations),
+        sceneHints: pickIdentityList(extras.sceneHints, savedExtras.sceneHints),
+        voiceMatches: pickIdentityList(extras.voiceMatches, savedExtras.voiceMatches),
+        userActions: extras.userActions || decisionsBefore?.actions || prior?.userActions || [],
+        prior,
+        force: extras.force !== false,
+      });
+      store.writeCharacterIdentity(videoKey, registry);
+      const decisions = {
+        schemaVersion: 1,
+        videoId: videoKey,
+        actions: registry.userActions || [],
+        pending: registry.pendingActions || [],
+      };
+      store.writeIdentityDecisions(videoKey, decisions);
+      return { ok: true, registry, decisions };
+    } catch (e) {
+      return {
+        ok: false,
+        reason: 'identity_failed',
+        error: e.message,
+        decisions: store.readIdentityDecisions(videoKey),
+      };
+    }
+  }
+
+  function updateCharacterIdentity(videoKey, action) {
+    const decisions = store.readIdentityDecisions(videoKey);
+    const prior = store.readCharacterIdentity(videoKey);
+    if (!prior && !decisions) return { ok: false, reason: 'not_enabled' };
+    const userActions = [...(decisions?.actions || prior?.userActions || [])];
+    if (action?.type === 'undo') {
+      if (!userActions.length) return { ok: false, reason: 'nothing_to_undo' };
+      userActions.pop();
+    } else if (action?.type) {
+      userActions.push({ ...action, seq: userActions.length + 1 });
+    } else {
+      return { ok: false, reason: 'invalid_action' };
+    }
+    return resolveStoredCharacterIdentity(videoKey, { userActions, force: true });
+  }
+
   return {
     index,
     indexChunk,
@@ -2976,6 +3163,8 @@ export function createVideoIndexEngine({
     startBackgroundIndex,
     startLongIndex,
     indexAdaptive,
+    resolveStoredCharacterIdentity,
+    updateCharacterIdentity,
     prepareSourceForIndex,
     jobStatus,
     jobCancel,

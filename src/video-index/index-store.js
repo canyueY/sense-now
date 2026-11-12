@@ -22,6 +22,8 @@ export const LAYOUT = Object.freeze({
     topics: 'summary/topics.json',
     entityOverview: 'summary/entity-overview.json',
     keyMoments: 'summary/key-moments.json',
+    characterIdentity: 'summary/character-identity.json',
+    characterIdentityDecisions: 'summary/character-identity-decisions.json',
   },
   detail: {
     timeline: 'detail/timeline.json',
@@ -217,6 +219,8 @@ export function createIndexStore({ rootDir, recoverOnCreate = true } = {}) {
     recommendations = null,
     effectivePolicy = null,
     audit = null,
+    characterIdentity = null,
+    identityDecisions = null,
   }) {
     ensureDirs(dir);
     const w = (rel, value) => writeJsonAtomic(resolveInside(dir, rel), value);
@@ -235,6 +239,8 @@ export function createIndexStore({ rootDir, recoverOnCreate = true } = {}) {
     if (recommendations != null) w(LAYOUT.analysis.recommendations, recommendations);
     if (effectivePolicy != null) w(LAYOUT.analysis.effectivePolicy, effectivePolicy);
     if (audit != null) w(LAYOUT.analysis.audit, audit);
+    if (characterIdentity != null) w(LAYOUT.summary.characterIdentity, characterIdentity);
+    if (identityDecisions != null) w(LAYOUT.summary.characterIdentityDecisions, identityDecisions);
     w(LAYOUT.evidence.index, evidenceIndex);
     w(LAYOUT.evidence.storyboard, storyboardIndex);
     w(LAYOUT.evidence.audio, audioIndex);
@@ -451,8 +457,40 @@ export function createIndexStore({ rootDir, recoverOnCreate = true } = {}) {
       evidenceIndex: arr(LAYOUT.evidence.index),
       storyboardIndex: arr(LAYOUT.evidence.storyboard),
       audioIndex: arr(LAYOUT.evidence.audio),
+      characterIdentity: obj(LAYOUT.summary.characterIdentity),
+      identityDecisions: obj(LAYOUT.summary.characterIdentityDecisions),
       dir,
     };
+  }
+
+  function readCharacterIdentity(videoKey) {
+    try {
+      const file = resolveInside(activeDir(videoKey), LAYOUT.summary.characterIdentity);
+      return readJson(file, { optional: true });
+    } catch {
+      return null;
+    }
+  }
+
+  function writeCharacterIdentity(videoKey, registry) {
+    const dir = ensureLayout(videoKey);
+    writeJsonAtomic(resolveInside(dir, LAYOUT.summary.characterIdentity), registry);
+    return registry;
+  }
+
+  function readIdentityDecisions(videoKey) {
+    try {
+      const file = resolveInside(activeDir(videoKey), LAYOUT.summary.characterIdentityDecisions);
+      return readJson(file, { optional: true });
+    } catch {
+      return null;
+    }
+  }
+
+  function writeIdentityDecisions(videoKey, decisions) {
+    const dir = ensureLayout(videoKey);
+    writeJsonAtomic(resolveInside(dir, LAYOUT.summary.characterIdentityDecisions), decisions);
+    return decisions;
   }
 
   function list() {
@@ -577,6 +615,10 @@ export function createIndexStore({ rootDir, recoverOnCreate = true } = {}) {
     readManifest,
     commit,
     loadIndex,
+    readCharacterIdentity,
+    writeCharacterIdentity,
+    readIdentityDecisions,
+    writeIdentityDecisions,
     list,
     remove,
     resolveEvidenceFile,
