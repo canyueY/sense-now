@@ -32,6 +32,7 @@ export function createJobController({
   log = () => {},
   workerRunner = null,
   speakerMerge = null,
+  onIndexed = null,
 } = {}) {
   if (!rootDir) throw new Error('rootDir required');
   if (typeof indexChunk !== 'function') throw new Error('indexChunk required');
@@ -486,7 +487,26 @@ export function createJobController({
     }
 
     const catalog = store.rebuildCatalog();
-    const finalState = failed && !ready ? 'failed' : (degraded || failed ? 'degraded' : 'ready');
+    let finalState = failed && !ready ? 'failed' : (degraded || failed ? 'degraded' : 'ready');
+    let characterIdentityCap = null;
+    if (typeof onIndexed === 'function' && (finalState === 'ready' || finalState === 'degraded')) {
+      try {
+        const indexed = onIndexed({ videoKey, capabilities, state: finalState, sourceDescriptor });
+        if (indexed && indexed.ok === false) {
+          characterIdentityCap = 'degraded';
+          if (finalState === 'ready') finalState = 'degraded';
+          log(`character identity degraded: ${indexed.reason || indexed.error || 'failed'}`);
+        } else if (indexed && indexed.ok === true && capabilities?.characterIdentity === 'on') {
+          characterIdentityCap = 'ready';
+        }
+      } catch (e) {
+        log(`onIndexed failed: ${e.message}`);
+        characterIdentityCap = 'degraded';
+        if (finalState === 'ready') finalState = 'degraded';
+      }
+    }
+    const jobCapabilities = { speakerMerge: speakerMergeCap };
+    if (characterIdentityCap) jobCapabilities.characterIdentity = characterIdentityCap;
     const final = jobs.updateJob(jobId, {
       state: finalState,
       stage: finalState,
@@ -499,12 +519,11 @@ export function createJobController({
         currentStage: finalState,
       },
       catalogChunks: catalog.length,
-      capabilities: { speakerMerge: speakerMergeCap },
+      capabilities: jobCapabilities,
     }) || { state: finalState, progress: { readyChunks: ready } };
 
     try { jobs.releaseLock(videoKey, { nonce: lockNonce }); } catch { /* ignore */ }
     live.delete(jobId);
-    void sourceDescriptor;
     void workerRunner;
     return {
       jobId,
@@ -512,7 +531,7 @@ export function createJobController({
       state: final.state,
       progress: final.progress,
       catalogChunks: catalog.length,
-      capabilities: { speakerMerge: speakerMergeCap },
+      capabilities: jobCapabilities,
     };
 
     function finishCancelled() {

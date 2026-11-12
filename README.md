@@ -21,7 +21,7 @@ Sense Now 是一个面向 [DSH](https://github.com/deepseek-ai) 的本地多模�
 | 运行时 | Node.js ≥ 20；DSH desktop profile |
 | 平台 | Windows-first（屏幕采集用 `ddagrab` / `gdigrab`），索引与检索跨平台 |
 | 外部依赖 | FFmpeg / ffprobe（必需）、yt-dlp（仅 B 站）、Python 组件（全部可选） |
-| 测试基线 | **61 个 `*.test.mjs` / 303 项测试 / 0 失败**，CI 双平台 |
+| 测试基线 | **63 个 `*.test.mjs` / 322 项测试 / 0 失败**，CI 双平台 |
 | 许可 | Apache-2.0 |
 
 > 这是开发版：单元测试与合成 benchmark **不能**解读为所有媒体、OCR、声卡和 B 站 CDN 都已实机验证。
@@ -146,6 +146,22 @@ OCR 读取是**真流式**的：FFmpeg rawvideo 按帧消费，不全量缓冲 s
 `query` 的模型可见文本里直接给出 `[mm:ss–mm:ss] 台词 (EVID_xxx)`、章节与截断说明，
 不是只返回“命中 20 条”的计数；视觉问题则返回帧号与时间戳，必要时再 `zoom` 取图。
 证据不足时明确写“证据不足”，不会编造引用。
+
+### 2.7 单视频人物身份（B1，可选）
+
+索引时设置 `capabilities.characterIdentity = "on"`，会在现有字幕、ASR、OCR、时间轴和可选说话人分离结果之上生成
+`summary/character-identity.json`。人物、画面轨迹、说话人、姓名、候选关系、证据和变更事件分开保存；内部编号不随显示名变化。
+开关默认关闭，关闭时不会写入人物身份文件，也不会改变原始字幕或 ASR 文本。
+
+- 称呼、姓名介绍和说话人归属分开处理；“小明，你在哪里”不会把说话人直接认成小明。
+- 电话或离屏台词不会仅因画面中有人就归给该人物。后续姓名介绍与清晰声纹形成充分证据后，才会回溯更新同一说话人的显示归属。
+- 每个说话人同时只保留一条生效人物归属。人工确认优先于自动结果；被取代的关系保留证据并标记 `overridden`。
+- 人工确认、否认、改名、关联、解除、合并、拆分和撤销写入独立决定日志，重建索引时回放。无法映射的决定进入 `pending_review`，不会静默套到其他人物。
+- 查询缓存包含身份修订号；人物身份改变后不会返回旧称呼。长视频、URL 与 B 站分块路径使用同一解析层，本地说话人编号按 chunk 隔离。
+- 解析失败时保留原始文本和已有人工决定，并将对应索引或分块作业标成 `degraded`。
+
+`visualTracks`、`identityObservations`、`voiceMatches` 和 `sceneHints` 是调用方提供的已有分析结果；B1 不新增或替换人脸、口型、ASR、OCR、pyannote 或声纹模型。
+数据结构、状态和人工操作细节见 [`docs/character-identity.md`](./docs/character-identity.md)。
 
 ## 3. 安装
 
@@ -418,6 +434,9 @@ profile 是用户选择的分析倾向，不是隐式自动开关。当前包含
 | `capture_start` / `capture_stop` | 显式开始/停止抓播；无 URL 时属 system-mix 录音授权 |
 | `refine` | B 站 URL 补洞或确认二次分析计划（`confirmation.planHash`） |
 | `execute_refinement` | 确认并执行 query 产生的 on-demand ASR 计划 |
+| `identity_resolve` / `identity_list` / `identity_detail` | 解析、列出和查看单视频人物身份 |
+| `identity_confirm` / `identity_deny` / `identity_rename` | 人工确认、否认或修改人物显示名 |
+| `identity_link` / `identity_unlink` / `identity_merge` / `identity_split` / `identity_undo` | 管理人物与说话人的归属，并支持撤销最近一次决定 |
 
 ## 8. Agent 协议要点
 
@@ -556,9 +575,9 @@ video-index/
 
 | 项 | 值 |
 |---|---|
-| 测试文件 | **61 个** `test/*.test.mjs` |
-| 测试项 | **303 项**，`npm test`（Node 内置 test runner），本机约 17 s |
-| 结果 | **303 pass / 0 fail**（本机 Node v24.21.0；CI 用 Node 20 同样通过） |
+| 测试文件 | **63 个** `test/*.test.mjs` |
+| 测试项 | **322 项**，`npm test`（Node 内置 test runner），本机约 17 s |
+| 结果 | **322 pass / 0 fail**（本机 Node v24.21.0；CI 用 Node 20） |
 | CI | GitHub Actions，`windows-latest` + `ubuntu-latest` 双平台矩阵 |
 | CI 步骤 | `python -m py_compile`（3 个 runner + 3 个悬浮窗脚本）→ `npm test` → `npm pack --dry-run --json` |
 | 打包体积 | `npm pack`：**122 个条目 / 2.25 MB**（unpacked），不含 `.env`、`__pycache__`、`.pyc`、模型缓存与测试媒体 |
@@ -566,7 +585,7 @@ video-index/
 
 ### 13.2 分领域覆盖
 
-61 个文件按职责分布如下（项数合计 303）：
+63 个文件按职责分布如下（项数合计 322）：
 
 | 领域 | 代表文件 | 项数 | 主要断言 |
 |---|---|---|---|
@@ -574,7 +593,7 @@ video-index/
 | 长视频索引与检索 | `subtitle-first-production`、`subtitle-first-index`、`video-index-engine`、`video-index-tool`、`subtitle-parse`、`context-builder`、`query-router` | **104** | 字幕优先级与分层 OCR、覆盖率、时长路由、query 文本/引用、预算截断、时间词路由、证据包 |
 | 分块 / job / 存储 | `chunk-store-job`、`chunk-plan`、`chunked-query`、`chunk-path-security`、`index-staging`、`index-cleanup`、`job-cancel-terminal`、`job-id-validation` | **32** | 原子提交与 staging 发布、`rebuild` 真重跑、cancel 终态不可逆、路径穿越、`.building.json` 清理 |
 | 远程与媒体代理 | `url-allowlist`、`bilibili-source`、`long-video-remote-cdp`、`metered-media-proxy`、`remote-media-limits`、`media-extract` | **27** | 域名白名单与 SSRF、Range 代理与字节上限、CDP 仅 loopback、字幕 Content-Type |
-| 说话人 / 身份 / embedding | `speaker-view`、`speaker-merge-production`、`identity-resolver`、`pyannote-runner`、`embedding-segment` | **28** | 匿名簇与跨 chunk 合并、身份只能由多模态证据升级、纯音频不得 `ready` |
+| 说话人 / 身份 / embedding | `speaker-view`、`speaker-merge-production`、`identity-resolver`、`character-identity*`、`pyannote-runner`、`embedding-segment` | **47** | 匿名簇与跨 chunk 合并、单视频人物归属、人工决定回放、缓存修订、失败降级、纯音频不得 `ready` |
 
 ### 13.3 基准实测（本机，2026-11-03）
 
@@ -615,12 +634,14 @@ npm run bench:long-video
 - 字幕下载的 SSRF / Content-Type / 字节上限；CDP 仅 loopback。
 - `.building.json` 发布后清理、残留不把 `ready` 降级；`rebuild:true` 真的重跑 chunk。
 - query 文本通道：台词 + `EVID_`、换行折叠、截断计数、证据不足与空证据的表述。
+- 人物身份规则：电话与离屏台词、称呼/介绍分离、弱声纹、人工决定、冲突、回溯、分块编号隔离和失败降级。
 
 **仍需自行实机确认**（自动化不冒充）：
 
 - 不同 B 站账号、字幕权限、CDN、地区与签名 URL 的端到端稳定性。
 - 真实 OCR / VAD / ASR 在多种分辨率、噪声与语言条件下的准确率。
 - 真实多人场景的跨 chunk speaker 一致率与「人脸—音色」绑定质量。
+- 真实成片中的口型对齐、pyannote 聚类、B 站字幕端到端身份和多人同时说话错误率。
 - 不同 Windows 声卡与 loopback backend 的兼容性。
 - 真实长视频（数小时）的端到端耗时与内存曲线。
 
@@ -671,7 +692,7 @@ src/
     adapters/                      字幕、ASR、OCR、VAD、pyannote、B 站等
 scripts/                           Python runners、bench、install-dev、smoke
 examples/floating-chat/            悬浮窗 bundle
-test/                              61 个测试文件 / 303 项测试
+test/                              63 个测试文件 / 322 项测试
 docs/                              方案、调参与复验文档
 ```
 
@@ -691,7 +712,7 @@ import { createVideoIndexEngine } from "sense-now/video-index";
 ## 16. 开发
 
 ```bash
-npm test                                          # 303 项
+npm test                                          # 322 项
 npm run bench:video-index -- --synthetic          # 索引/检索基线
 npm run bench:long-video                          # 6h / 72 chunk 基准
 npm pack --dry-run --json --ignore-scripts
